@@ -6,6 +6,7 @@ import (
 	"aurora/internal/chatgpt"
 	"aurora/internal/config"
 	"aurora/middlewares"
+	"io"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,6 +26,10 @@ func RegisterRouter(accountPool *accounts.Pool, cfg *config.Config) *gin.Engine 
 	audioHandler := NewAudioHandler(accountPool, cfg)
 	authHandler := NewAuthHandler(accountPool)
 	modelsHandler := NewModelsHandler(accountPool, cfg)
+	imageProxy, err := newImageProxy(accountPool, cfg)
+	if err != nil {
+		panic(err)
+	}
 
 	// 初始化基础前置参数（DPL、BasicCookies 等）
 	// 用配置的代理访问 chatgpt.com,否则本机连不上 → BasicCookies 收集不到
@@ -35,8 +40,15 @@ func RegisterRouter(accountPool *accounts.Pool, cfg *config.Config) *gin.Engine 
 	client := bogdanfinn.NewStdClient()
 	chatgpt.GetDpl(client, proxyUrl)
 
-	router := gin.Default()
+	router := gin.New()
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{Skip: skipImageProxyLog}), gin.Recovery())
 	router.Use(middlewares.Cors)
+	chatgpt.ImageProxyURL = nil
+	if imageProxy != nil {
+		chatgpt.ImageProxyURL = imageProxy.URL
+		// Suppress request dumps for this capability-bearing route, even on panic.
+		router.GET(imageProxyPrefix+":owner/:file/:signature", gin.RecoveryWithWriter(io.Discard), imageProxy.Serve)
+	}
 
 	router.GET("/", func(c *gin.Context) { c.JSON(200, gin.H{"message": "Hello, world!"}) })
 	router.GET("/ping", func(c *gin.Context) { c.JSON(200, gin.H{"message": "pong"}) })

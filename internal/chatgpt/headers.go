@@ -191,10 +191,10 @@ func conversationFetchHeaders(account *accounts.Account) httpclient.AuroraHeader
 	header := baseHeaderFromAccount(account)
 	header.Set("Accept", "application/json")
 	header.Set("Content-Type", "application/json")
-	if account.Token != "" {
+	if account != nil && account.Token != "" {
 		header.Set("Authorization", "Bearer "+account.Token)
 	}
-	if account.PUID != "" {
+	if account != nil && account.PUID != "" {
 		header.Set("Cookie", "_puid="+account.PUID+";")
 	}
 	setTeamAccountHeader(header, account)

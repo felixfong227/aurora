@@ -180,6 +180,10 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 			ArtifactDelivery: original_request.ArtifactDelivery,
 			ProxyURL:         proxyUrl,
 		})
+		if result.Err != nil {
+			httpstream.WriteChatCompletionError(c, result.Err)
+			return
+		}
 		wsConn = nil
 		continue_info = result.Continue
 		full_response += result.Text
@@ -425,6 +429,10 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 				Websocket:   wsConn,
 				ClientState: clientState,
 			})
+			if result.Err != nil {
+				httpstream.WriteChatCompletionError(c, result.Err)
+				return
+			}
 			wsConn = nil
 			full_response += result.Text
 			full_thinking += result.ThinkingText
@@ -535,6 +543,10 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 			ClientState:    clientState,
 			SuppressOutput: true,
 		})
+		if result.Err != nil {
+			writeResponsesHandlerError(c, result.Err)
+			return
+		}
 		wsConn = nil
 		full_response += result.Text
 		full_thinking += result.ThinkingText
@@ -833,6 +845,10 @@ func (h *ChatHandler) executeToolCalling(c *gin.Context, originalRequest *offici
 			ProxyURL:         *proxyUrl,
 		})
 		response.Body.Close()
+		if result.Err != nil {
+			httpstream.WriteChatCompletionError(c, result.Err)
+			return toolCallingResult{}, false
+		}
 
 		lastText = result.Text
 		lastConversationID = result.ConversationID
@@ -951,4 +967,11 @@ func (h *ChatHandler) ChatGPTConversation(c *gin.Context) {
 	if _, err := io.Copy(c.Writer, response.Body); err != nil {
 		c.JSON(500, gin.H{"error": "Error sending response"})
 	}
+}
+
+// writeResponsesHandlerError terminates an already-started Responses stream.
+func writeResponsesHandlerError(c *gin.Context, err error) {
+	c.Writer.WriteString("event: response.failed\ndata: " + responsesFailedEvent(err.Error()) + "\n\n")
+	c.Writer.Flush()
+	c.Abort()
 }

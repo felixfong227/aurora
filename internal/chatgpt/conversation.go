@@ -342,6 +342,8 @@ type ContinueInfo struct {
 
 // HandlerResult 是 HandlerDetailedWithOptions 的返回值。
 type HandlerResult struct {
+	// Err stops callers from emitting a successful completion after recovery fails.
+	Err               error
 	Text              string
 	ThinkingText      string
 	ConversationID    string

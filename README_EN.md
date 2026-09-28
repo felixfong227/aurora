@@ -6,6 +6,8 @@ Aurora converts the ChatGPT Web backend into an OpenAI-style API, supporting cha
 
 For full endpoints, authentication, token exchange, and curl examples, see: [API.md](API.md)
 
+For this fork's LibreChat image delivery and no-disk relay, see [LIBRECHAT.md](LIBRECHAT.md).
+
 ## Features
 
 - OpenAI-style `/v1/chat/completions` with streaming and non-streaming support, including parameters such as `temperature`/`top_p`/`max_tokens`/`stop`/`reasoning_effort`/`response_format`/`stream_options.include_usage`.

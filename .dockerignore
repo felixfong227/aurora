@@ -31,3 +31,14 @@ target/
 .env
 .env.*
 secrets.yaml
+
+# Local credentials and proxies must not enter builder layers or caches.
+**/accounts.txt
+**/authenticated_accounts.txt
+**/100-ACCOUNTS_COMPILED.txt
+**/access_tokens.txt
+**/refresh_tokens.txt
+**/session_tokens.txt
+**/free_tokens.txt
+**/proxies.txt
+tools/authenticator/.proxies.txt.swp

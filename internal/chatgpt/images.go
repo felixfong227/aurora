@@ -3,6 +3,7 @@ package chatgpt
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,10 @@ import (
 	"aurora/internal/accounts"
 	chatgpt_types "aurora/typings/chatgpt"
 )
+
+// ImageProxyURL optionally maps an account and file ID to a browser-safe
+// capability URL, returning empty when unsupported. Set once before serving.
+var ImageProxyURL func(*accounts.Account, string) string
 
 // ImageGenerationResult 表示一次图片生成的结果。
 type ImageGenerationResult struct {
@@ -63,6 +68,11 @@ func GetImageSource(client httpclient.AuroraHttpClient, wg *sync.WaitGroup, url 
 	err = json.NewDecoder(response.Body).Decode(&file_info)
 	if err != nil || file_info.Status != "success" {
 		return
+	}
+	if ImageProxyURL != nil {
+		if proxyURL := ImageProxyURL(account, extractFileID(url)); proxyURL != "" {
+			file_info.DownloadURL = proxyURL
+		}
 	}
 	imgSource[idx] = "[![image](" + file_info.DownloadURL + " \"" + prompt + "\")](" + file_info.DownloadURL + ")"
 }
@@ -288,11 +298,23 @@ func CollectImageResults(response *http.Response, client httpclient.AuroraHttpCl
 }
 
 func getConversation(client httpclient.AuroraHttpClient, account *accounts.Account, conversationID string) (map[string]interface{}, error) {
+	return getConversationWithContext(context.Background(), client, account, conversationID)
+}
+
+func getConversationWithContext(ctx context.Context, client httpclient.AuroraHttpClient, account *accounts.Account, conversationID string) (map[string]interface{}, error) {
 	if conversationID == "" {
 		return nil, fmt.Errorf("missing conversation id")
 	}
 	reqURL := BaseURL + "/conversation/" + conversationID
-	response, err := client.Request(http.MethodGet, reqURL, conversationFetchHeaders(account), nil, nil)
+	var response *http.Response
+	var err error
+	if contextual, ok := client.(interface {
+		RequestWithContext(context.Context, httpclient.HttpMethod, string, httpclient.AuroraHeaders, []*http.Cookie, io.Reader) (*http.Response, error)
+	}); ok {
+		response, err = contextual.RequestWithContext(ctx, httpclient.GET, reqURL, conversationFetchHeaders(account), nil, nil)
+	} else {
+		response, err = client.Request(httpclient.GET, reqURL, conversationFetchHeaders(account), nil, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
