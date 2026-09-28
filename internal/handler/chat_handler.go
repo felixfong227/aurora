@@ -91,9 +91,6 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 
 	// 工具调用模式判定
 	toolsEnabled := toolCallingEnabled(original_request.Tools, h.cfg)
-	if toolsEnabled && h.cfg.StreamMode {
-		original_request.Stream = false
-	}
 
 	// Convert the chat request to a ChatGPT request
 	translated_request := chatgptrequestconverter.ConvertAPIRequest(original_request, account, proxyUrl, client)
@@ -774,16 +771,71 @@ func (h *ChatHandler) handleToolCalling(c *gin.Context, originalRequest *officia
 	if !ok {
 		return
 	}
+	writeToolCallingResult(c, originalRequest, result, *reqModel, *inputTokens)
+}
+
+func writeToolCallingResult(c *gin.Context, request *officialtypes.APIRequest, result toolCallingResult, model string, inputTokens int) {
+	outputTokens := util.CountToken(result.Text)
+	if request.Stream {
+		// Tool emulation buffers upstream text for parsing, but must still honor
+		// the client's SSE protocol rather than returning a JSON completion.
+		httpstream.WriteSSEHeader(c)
+		chunk := officialtypes.NewChatCompletionChunk(result.Text, model)
+		chunk.ConversationID = result.ConversationID
+		chunk.Choices[0].Delta.Role = "assistant"
+		if !httpstream.WriteSSEEvent(c, "", chunk) {
+			return
+		}
+		for index, call := range result.ToolCalls {
+			chunk = officialtypes.NewToolCallChunk(model, officialtypes.ToolCallDelta{
+				Index: index, ID: call.ID, Type: call.Type,
+				Function: officialtypes.ToolCallFuncDelta{
+					Name: call.Function.Name, Arguments: call.Function.Arguments,
+				},
+			})
+			chunk.ConversationID = result.ConversationID
+			if !httpstream.WriteSSEEvent(c, "", chunk) {
+				return
+			}
+		}
+		for _, metadata := range result.Sentinel {
+			chunk = officialtypes.NewChatCompletionChunk("", model)
+			chunk.ConversationID = result.ConversationID
+			chunk.Sentinel = metadata
+			if !httpstream.WriteSSEEvent(c, "", chunk) {
+				return
+			}
+		}
+		reason := "stop"
+		if len(result.ToolCalls) > 0 {
+			reason = "tool_calls"
+		}
+		if !httpstream.WriteSSEEvent(c, "", officialtypes.StopChunkWithConversation(reason, model, result.ConversationID)) {
+			return
+		}
+		if request.StreamOptions != nil && request.StreamOptions.IncludeUsage {
+			chunk = officialtypes.NewChatCompletionChunk("", model)
+			chunk.Choices = []officialtypes.Choices{}
+			chunk.Usage = &officialtypes.StreamUsage{
+				PromptTokens: inputTokens, CompletionTokens: outputTokens,
+				TotalTokens: inputTokens + outputTokens,
+			}
+			if !httpstream.WriteSSEEvent(c, "", chunk) {
+				return
+			}
+		}
+		httpstream.WriteDone(c)
+		return
+	}
 	if len(result.ToolCalls) > 0 {
 		c.JSON(200, officialtypes.NewChatCompletionWithToolCalls(
 			result.Text, "", result.ToolCalls,
-			*inputTokens, util.CountToken(result.Text),
-			*reqModel, result.ConversationID, result.Sentinel,
+			inputTokens, outputTokens,
+			model, result.ConversationID, result.Sentinel,
 		))
 		return
 	}
-	outputTokens := util.CountToken(result.Text)
-	c.JSON(200, officialtypes.NewChatCompletionWithMetadata(result.Text, *inputTokens, outputTokens, *reqModel, result.ConversationID, result.Sentinel))
+	c.JSON(200, officialtypes.NewChatCompletionWithMetadata(result.Text, inputTokens, outputTokens, model, result.ConversationID, result.Sentinel))
 }
 
 func applyClientStateToToolRequest(request *chatgpt_types.ChatGPTRequest, state *chatgpt.ChatClientState) {
