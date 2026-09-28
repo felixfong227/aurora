@@ -53,11 +53,107 @@ The relay accepts raster images from the configured backend's exact
 `/estuary/content` endpoint. It rejects redirects, other origins, HTML and SVG.
 It supports configured accounts, not temporary externally supplied tokens.
 
+## Opt-in conversation continuity
+
+Aurora can map one fresh LibreChat conversation to one upstream ChatGPT thread.
+It requires persistent metadata storage and both trusted identity headers on
+every Chat Completions request. It never finds a conversation from a prompt.
+
+Set `CONVERSATION_STATE_DIR` to a persistent directory private to Aurora. The
+directory must be writable by the container's nonroot UID, with mode `0700`.
+Aurora creates it if its parent is writable; checkpoint files use mode `0600`.
+For example, mount a named volume at the image's nonroot-owned `/home/nonroot`
+and set `CONVERSATION_STATE_DIR=/home/nonroot/conversations`. Verify ownership
+for your image instead of assuming `/data` is writable. Use one Aurora process
+per directory, not replicas sharing the volume.
+
+The existing `ENABLE_HISTORY` setting is unchanged. These checkpoints do not
+override upstream temporary-chat retention or make temporary chats appear in
+ChatGPT's history. An expired/deleted upstream thread fails rather than being
+replaced with a new one.
+
+Configure LibreChat's built-in OpenAI endpoint with server-resolved headers:
+
+```yaml
+endpoints:
+  openAI:
+    titleConvo: false
+    headers:
+      X-Aurora-User-Id: "{{LIBRECHAT_USER_ID}}"
+      X-Aurora-Conversation-Id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+```
+
+Keep the existing gateway `Authorization` credential. Do not expose that
+credential to untrusted callers who could forge another user's headers. The
+gateway must supply the authenticated user ID, not accept it from browser input.
+Separate title generation must remain disabled; titles can be set manually.
+`BODY_MESSAGEID` and `BODY_PARENTMESSAGEID` are not used as upstream identities.
+
+### Supported turns
+
+- Start a **new** LibreChat conversation with one user message and optional
+  leading `system` instructions. Conversations created before enabling this
+  feature have no mapping and cannot be backfilled from their transcript.
+- Subsequent requests must include the complete visible branch history, followed
+  by one new user message or one result for each pending tool call.
+- Aurora matches hashes only within the authenticated gateway/user/conversation
+  scope. It submits only the new suffix with the recorded upstream conversation
+  and assistant parent IDs. Fixed instructions are not appended again.
+- An edit of the newest user message after a proven assistant checkpoint can
+  form a branch inside the same upstream conversation. The entire prefix through
+  that assistant must match. A matching last prompt alone is never sufficient.
+- Fixed-definition agent tools work with JSON and SSE responses. Emulated tool
+  calls have canonical empty assistant content plus `tool_calls`, so raw
+  `<tool_call>` markup is not replayed. Tool IDs remain significant; argument
+  JSON whitespace/key order and streaming indexes are normalized.
+- Model, reasoning effort and sampling controls may change without changing the
+  upstream thread. Existing model translation behavior is unchanged.
+- Checkpoints and stable account binding survive restart and access-token
+  renewal. Continuation uses the same configured account's TLS client; removing
+  or disabling that account returns a conflict, never a random replacement.
+
+### Deliberate conflicts and limits
+
+Missing one header, empty/duplicate headers, absent state configuration, unknown
+history, changed retained instructions or unavailable account return HTTP 409.
+Requests with neither header remain stateless. Do not remove both headers from
+an active integration as a workaround for a conflict.
+
+This version rejects pruned histories, changed ancestors, first-turn regeneration,
+retries of completed requests, ambiguous checkpoints, file/image inputs and
+unsupported message roles such as `developer`. It does not promise recovery of
+an old conversation after state loss. Keep the state volume and gateway credential
+stable; rotating the credential changes its scope.
+
+System instructions, tool definitions/descriptions, `tool_choice`, and controls
+the converter embeds in the prompt, such as `max_tokens`, `stop` and
+`response_format`, must remain fixed. Changes return a conflict rather than
+silently keeping old instructions. In particular, LibreChat Image Creator
+followups that change tool context/descriptions when image IDs become available
+are not supported. Fixed-definition image-tool results can continue the chat,
+but native `/images/generations` jobs still create separate upstream image jobs.
+This does **not** make native image generation/editing part of the chat thread.
+The Responses API's `previous_response_id` behavior is unchanged.
+
+Aurora durably marks a turn in flight before contacting upstream. Timeout,
+disconnect, missing terminal event, length-limited partial completion or failed
+commit leaves the outcome blocked, including after restart. Internal tool-refusal
+retries are disabled for opted-in turns. An operator must inspect an unknown
+outcome; do not delete its state and blindly retry. There is no automatic
+reconciliation or cached-response replay. Streaming may already have delivered
+partial text before the error; no checkpoint is committed for that partial text.
+
+State files contain only hashes, upstream IDs, account identity hashes and an
+in-flight flag, not credentials, images or message bodies. Hashes are still
+sensitive metadata. Back up the volume privately. Checkpoints have no automatic
+expiry; storage grows with conversations/turns. Retire state only when the
+corresponding conversations will no longer be used.
+
 ## Limits
 
 - This does not replace LibreChat's upload storage or synchronize ChatGPT Library.
 - Existing blank messages are not retroactively repaired.
-- It does not map successive LibreChat turns to the same ChatGPT conversation.
+- Stateless requests and native image jobs do not share a ChatGPT conversation.
 - Partial answers and `continue` handoffs fail explicitly rather than replaying
   content already delivered.
 - No usage/billing policy is enforced by these compatibility fixes.

@@ -167,10 +167,12 @@ type HandlerDetailedOptions struct {
 	ProxyURL         string
 	Tools            []official_types.Tool
 	SuppressOutput   bool
+	// DeferTerminal lets the caller durably checkpoint before reporting success.
+	DeferTerminal bool
 }
 
 // HandlerDetailedWithOptions 处理对话响应流（最完整版）。
-func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client httpclient.AuroraHttpClient, account *accounts.Account, uuid string, translated_request chatgpt_types.ChatGPTRequest, stream bool, model string, options HandlerDetailedOptions) HandlerResult {
+func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client httpclient.AuroraHttpClient, account *accounts.Account, uuid string, translated_request chatgpt_types.ChatGPTRequest, stream bool, model string, options HandlerDetailedOptions) (result HandlerResult) {
 	if model == "" {
 		model = translated_request.Model
 	}
@@ -212,6 +214,23 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 	var isRole = true
 	var waitSource = false
 	var isEnd = false
+	var deferredTerminal *official_types.ChatCompletionChunk
+	emitTerminal := func(chunk official_types.ChatCompletionChunk) {
+		if options.DeferTerminal {
+			deferredTerminal = &chunk
+			return
+		}
+		c.Writer.WriteString("data: " + chunk.String() + "\n\n")
+		c.Writer.Flush()
+	}
+	defer func() {
+		result.Completed = result.Err == nil && isEnd && !max_tokens && finish_reason != "length" &&
+			result.ConversationID != "" && result.ParentMessageID != ""
+		result.DeferredTerminal = deferredTerminal
+		if deferredTerminal != nil {
+			result.StopSent = false
+		}
+	}()
 	var imgSource []string
 	renderedImageFiles := make(map[string]bool)
 	var convId string
@@ -500,8 +519,7 @@ readLoop:
 						finalizeArtifacts()
 						if streamOutput {
 							finalLine := official_types.StopChunkWithConversation(finish_reason, model, convId)
-							c.Writer.WriteString("data: " + finalLine.String() + "\n\n")
-							c.Writer.Flush()
+							emitTerminal(finalLine)
 						}
 						if max_tokens && convId != "" && assistantMessageID != "" {
 							return HandlerResult{
@@ -579,8 +597,7 @@ readLoop:
 					flushCites()
 					finalizeArtifacts()
 					if terminalChunk != nil {
-						c.Writer.WriteString("data: " + terminalChunk.String() + "\n\n")
-						c.Writer.Flush()
+						emitTerminal(*terminalChunk)
 					}
 					if max_tokens && convId != "" && assistantMessageID != "" {
 						return HandlerResult{
@@ -778,8 +795,7 @@ readLoop:
 				finalizeArtifacts()
 				if streamOutput {
 					final_line := official_types.StopChunkWithConversation(finish_reason, model, convId)
-					c.Writer.WriteString("data: " + final_line.String() + "\n\n")
-					c.Writer.Flush()
+					emitTerminal(final_line)
 				}
 				return HandlerResult{
 					Text:              strings.Join(imgSource, "") + finalText(),

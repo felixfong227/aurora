@@ -59,3 +59,14 @@ func TestGetBoolEnvInvalid(t *testing.T) {
 		t.Error("getBoolEnv with invalid value should return default (true)")
 	}
 }
+
+func TestConversationStateIsOptIn(t *testing.T) {
+	t.Setenv("CONVERSATION_STATE_DIR", "")
+	if got := Load().ConversationStateDir; got != "" {
+		t.Fatalf("continuity enabled by default: %q", got)
+	}
+	t.Setenv("CONVERSATION_STATE_DIR", "/private/checkpoints")
+	if got := Load().ConversationStateDir; got != "/private/checkpoints" {
+		t.Fatalf("state directory = %q", got)
+	}
+}

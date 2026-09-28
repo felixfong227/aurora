@@ -27,6 +27,8 @@ type Config struct {
 	ProxyURL            string
 	HTTPProxy           string
 	DebugSentinel       bool
+
+	ConversationStateDir string
 }
 
 func Load() Config {
@@ -52,6 +54,8 @@ func Load() Config {
 		ProxyURL:            os.Getenv("PROXY_URL"),
 		HTTPProxy:           os.Getenv("http_proxy"),
 		DebugSentinel:       getBoolEnv("DEBUG_SENTINEL", false),
+
+		ConversationStateDir: os.Getenv("CONVERSATION_STATE_DIR"),
 	}
 }
 

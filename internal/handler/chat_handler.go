@@ -14,6 +14,7 @@ import (
 	"aurora/internal/accounts"
 	"aurora/internal/chatgpt"
 	"aurora/internal/config"
+	"aurora/internal/continuity"
 	"aurora/internal/httpstream"
 	"aurora/internal/toolcall"
 	chatgpt_types "aurora/typings/chatgpt"
@@ -28,6 +29,7 @@ type ChatHandler struct {
 	accountPool *accounts.Pool
 	sessions    *SessionManager
 	cfg         *config.Config
+	continuity  *continuity.Store
 }
 
 func NewChatHandler(pool *accounts.Pool, cfg *config.Config) *ChatHandler {
@@ -35,6 +37,7 @@ func NewChatHandler(pool *accounts.Pool, cfg *config.Config) *ChatHandler {
 		accountPool: pool,
 		sessions:    NewSessionManager(),
 		cfg:         cfg,
+		continuity:  continuity.New(cfg.ConversationStateDir),
 	}
 }
 
@@ -60,7 +63,22 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 		return
 	}
 
-	account, _, err := resolveAccount(c, h.accountPool, h.cfg, original_requestHasFiles(original_request))
+	lease, account, err := h.prepareConversation(c, original_request)
+	if err != nil {
+		respondError(c, http.StatusConflict, err)
+		return
+	}
+	defer lease.Close()
+	inputMessages := original_request.Messages
+	if lease != nil {
+		original_request = lease.Request
+		if err := lease.Start(accounts.ImageIdentity(account, conversationIdentityKey)); err != nil {
+			respondError(c, http.StatusConflict, err)
+			return
+		}
+	} else {
+		account, _, err = resolveAccount(c, h.accountPool, h.cfg, original_requestHasFiles(original_request))
+	}
 	if err != nil {
 		c.JSON(400, gin.H{"error": gin.H{
 			"message": err.Error(),
@@ -77,7 +95,7 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 	}
 
 	proxyUrl := account.Proxy
-	input_tokens := countMessagesTokens(original_request.Messages)
+	input_tokens := countMessagesTokens(inputMessages)
 
 	uid := uuid.NewString()
 	// 优先用 account.Client（bootstrap.InitClient 时已绑 fingerprint + proxy）
@@ -94,11 +112,17 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 
 	// Convert the chat request to a ChatGPT request
 	translated_request := chatgptrequestconverter.ConvertAPIRequest(original_request, account, proxyUrl, client)
+	applyConversationLease(&translated_request, lease)
 
 	// 按 conversationID 复用 ChatClientState
 	var clientState *chatgpt.ChatClientState
 	if translated_request.ConversationID != "" {
 		clientState = h.sessions.Get(translated_request.ConversationID)
+		if lease != nil && clientState != nil {
+			// Keep device/session identity, but choose this branch's proven parent.
+			snapshot := *clientState
+			clientState = &snapshot
+		}
 	}
 	if clientState == nil {
 		clientState = chatgpt.NewChatClientState()
@@ -113,7 +137,7 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 
 	// 工具调用提前分支
 	if toolsEnabled {
-		h.handleToolCalling(c, &original_request, &client, account, &clientState, &reqModel, &uid, &proxyUrl, &input_tokens)
+		h.handleToolCalling(c, &original_request, &client, account, &clientState, &reqModel, &uid, &proxyUrl, &input_tokens, lease)
 		return
 	}
 
@@ -140,6 +164,7 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 	var conversationID string
 	var sentinel []map[string]interface{}
 	var stopSent bool
+	var completed bool
 	pingSent := false
 
 	// 记录请求开始时间，用于 TTFT / total-time 计时
@@ -169,16 +194,28 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 		c.Writer.Header().Set("Connection", "keep-alive")
 		c.Writer.Header().Set("X-Accel-Buffering", "no")
 	}
-	for i := h.cfg.MaxContinueCount; i > 0; i-- {
+	turnReads := h.cfg.MaxContinueCount
+	if lease != nil {
+		turnReads = 1 // Read the turn even when automatic continuation is disabled.
+	}
+	var deferredTerminal *officialtypes.ChatCompletionChunk
+	for i := turnReads; i > 0; i-- {
 		var continue_info *chatgpt.ContinueInfo
 		result := chatgpt.HandlerDetailedWithOptions(c, response, client, account, uid, translated_request, original_request.Stream, reqModel, chatgpt.HandlerDetailedOptions{
 			Websocket:        wsConn,
 			ClientState:      clientState,
 			ArtifactDelivery: original_request.ArtifactDelivery,
 			ProxyURL:         proxyUrl,
+			DeferTerminal:    lease != nil && original_request.Stream,
 		})
 		if result.Err != nil {
 			httpstream.WriteChatCompletionError(c, result.Err)
+			return
+		}
+		completed = result.Completed
+		deferredTerminal = result.DeferredTerminal
+		if lease != nil && !completed {
+			httpstream.WriteChatCompletionError(c, fmt.Errorf("continuity turn did not complete; outcome requires operator review"))
 			return
 		}
 		wsConn = nil
@@ -190,19 +227,26 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 			ttftSet = true
 			ttftMs = time.Since(startTime).Milliseconds()
 		}
+		parentMessageID := result.ParentMessageID
+		if continue_info != nil {
+			parentMessageID = continue_info.ParentID
+		}
+		clientState.NoteTurnResult(result.ConversationID, parentMessageID)
 		if result.ConversationID != "" {
 			conversationID = result.ConversationID
 			h.sessions.Register(conversationID, clientState)
 			if !pingSent && turnStile != nil {
 				pingSent = true
-				lastMsgID := result.ParentMessageID
+				lastMsgID := parentMessageID
 				pingClient := client
 				pingAccount := account
 				pingTurnStile := turnStile
+				pingState := *clientState
+				pingConversationID := conversationID
 				go func() {
-					perr := chatgpt.POSTSentinelPing(pingClient, pingAccount, pingTurnStile, conversationID, lastMsgID, clientState)
+					perr := chatgpt.POSTSentinelPing(pingClient, pingAccount, pingTurnStile, pingConversationID, lastMsgID, &pingState)
 					if h.cfg.DebugSentinel {
-						fmt.Printf("[sentinel-ping] conv=%s lastMsg=%s err=%v\n", conversationID, lastMsgID, perr)
+						fmt.Printf("[sentinel-ping] conv=%s lastMsg=%s err=%v\n", pingConversationID, lastMsgID, perr)
 					}
 				}()
 			}
@@ -211,11 +255,6 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 		if result.StopSent {
 			stopSent = true
 		}
-		parentMessageID := result.ParentMessageID
-		if continue_info != nil {
-			parentMessageID = continue_info.ParentID
-		}
-		clientState.NoteTurnResult(result.ConversationID, parentMessageID)
 		if continue_info == nil {
 			break
 		}
@@ -246,10 +285,25 @@ func (h *ChatHandler) Nightmare(c *gin.Context) {
 	if c.Writer.Status() != 200 {
 		return
 	}
+	if lease != nil {
+		if !completed {
+			httpstream.WriteChatCompletionError(c, fmt.Errorf("continuity turn did not complete"))
+			return
+		}
+		if err := commitConversation(lease, account, conversationID, clientState.ParentMessageID, full_response, nil); err != nil {
+			httpstream.WriteChatCompletionError(c, err)
+			return
+		}
+	}
 	if !original_request.Stream {
 		output_tokens := util.CountToken(full_response)
 		c.JSON(200, officialtypes.NewChatCompletionWithMetadataAndReasoning(full_response, full_thinking, input_tokens, output_tokens, reqModel, conversationID, sentinel))
 	} else {
+		if deferredTerminal != nil {
+			c.Writer.WriteString("data: " + deferredTerminal.String() + "\n\n")
+			c.Writer.Flush()
+			stopSent = true
+		}
 		if original_request.StreamOptions != nil && original_request.StreamOptions.IncludeUsage {
 			output_tokens := util.CountToken(full_response)
 			msSinceStart := time.Since(startTime).Milliseconds()
@@ -359,7 +413,7 @@ func (h *ChatHandler) Responses(c *gin.Context) {
 
 	toolsEnabled := toolCallingEnabled(original_request.Tools, h.cfg) && !original_request.ToolChoice.IsForcedNone()
 	if toolsEnabled {
-		result, ok := h.executeToolCalling(c, &original_request, &client, account, &clientState, &reqModel, &uid, &proxyUrl)
+		result, ok := h.executeToolCalling(c, &original_request, &client, account, &clientState, &reqModel, &uid, &proxyUrl, nil)
 		if !ok {
 			return
 		}
@@ -766,10 +820,16 @@ type toolCallingResult struct {
 }
 
 // handleToolCalling 工具调用模式的主流程（对齐 initialize/handlers.go:handleToolCalling）
-func (h *ChatHandler) handleToolCalling(c *gin.Context, originalRequest *officialtypes.APIRequest, client **bogdanfinn.TlsClient, account *accounts.Account, clientState **chatgpt.ChatClientState, reqModel *string, uid *string, proxyUrl *string, inputTokens *int) {
-	result, ok := h.executeToolCalling(c, originalRequest, client, account, clientState, reqModel, uid, proxyUrl)
+func (h *ChatHandler) handleToolCalling(c *gin.Context, originalRequest *officialtypes.APIRequest, client **bogdanfinn.TlsClient, account *accounts.Account, clientState **chatgpt.ChatClientState, reqModel *string, uid *string, proxyUrl *string, inputTokens *int, lease *continuity.Lease) {
+	result, ok := h.executeToolCalling(c, originalRequest, client, account, clientState, reqModel, uid, proxyUrl, lease)
 	if !ok {
 		return
+	}
+	if lease != nil {
+		if err := commitConversation(lease, account, result.ConversationID, (*clientState).ParentMessageID, result.Text, result.ToolCalls); err != nil {
+			respondError(c, http.StatusConflict, err)
+			return
+		}
 	}
 	writeToolCallingResult(c, originalRequest, result, *reqModel, *inputTokens)
 }
@@ -846,7 +906,7 @@ func applyClientStateToToolRequest(request *chatgpt_types.ChatGPTRequest, state 
 	request.ParentMessageID = state.ParentMessageID
 }
 
-func (h *ChatHandler) executeToolCalling(c *gin.Context, originalRequest *officialtypes.APIRequest, client **bogdanfinn.TlsClient, account *accounts.Account, clientState **chatgpt.ChatClientState, reqModel *string, uid *string, proxyUrl *string) (toolCallingResult, bool) {
+func (h *ChatHandler) executeToolCalling(c *gin.Context, originalRequest *officialtypes.APIRequest, client **bogdanfinn.TlsClient, account *accounts.Account, clientState **chatgpt.ChatClientState, reqModel *string, uid *string, proxyUrl *string, lease *continuity.Lease) (toolCallingResult, bool) {
 	if account == nil || !account.Type.Satisfies(accounts.CapToolCalling) {
 		c.JSON(403, gin.H{"error": "Tool calling requires a logged-in ChatGPT account."})
 		return toolCallingResult{}, false
@@ -856,10 +916,14 @@ func (h *ChatHandler) executeToolCalling(c *gin.Context, originalRequest *offici
 	if maxRefusalRetries <= 0 {
 		maxRefusalRetries = 3
 	}
+	if lease != nil {
+		maxRefusalRetries = 1 // Never create hidden retry threads for a durable turn.
+	}
 
 	baseTranslated := chatgptrequestconverter.ConvertAPIRequest(*originalRequest, account, *proxyUrl, *client)
 	applyClientStateToToolRequest(&baseTranslated, *clientState)
-	if baseTranslated.ConversationID != "" {
+	applyConversationLease(&baseTranslated, lease)
+	if lease == nil && baseTranslated.ConversationID != "" {
 		*clientState = h.sessions.Get(baseTranslated.ConversationID)
 	}
 	if *clientState == nil {
@@ -901,6 +965,10 @@ func (h *ChatHandler) executeToolCalling(c *gin.Context, originalRequest *offici
 			httpstream.WriteChatCompletionError(c, result.Err)
 			return toolCallingResult{}, false
 		}
+		if lease != nil && !result.Completed {
+			respondError(c, http.StatusConflict, fmt.Errorf("continuity tool turn did not complete; outcome requires operator review"))
+			return toolCallingResult{}, false
+		}
 
 		lastText = result.Text
 		lastConversationID = result.ConversationID
@@ -928,6 +996,11 @@ func (h *ChatHandler) executeToolCalling(c *gin.Context, originalRequest *offici
 		}
 		if len(calls) > 0 {
 			lastToolCalls = calls
+			if lease != nil {
+				// Expose the same canonical assistant message in JSON and SSE;
+				// emulation markup is not assistant prose to replay next turn.
+				lastText = ""
+			}
 			break
 		}
 		if !looksLikeSandboxRefusal(result.Text) {

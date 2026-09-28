@@ -29,6 +29,17 @@ func ImageIdentity(account *Account, key []byte) string {
 // FindImageAccount returns a detached snapshot, never a randomly selected account.
 // Removing/disabling the configured account revokes its image links.
 func (p *Pool) FindImageAccount(identity string, key []byte) *Account {
+	return p.findIdentityAccount(identity, key, false)
+}
+
+// FindConversationAccount returns the configured pointer, like Acquire, so
+// failure reporting and renewal affect the same account and TLS client/session.
+// It never selects a replacement when the bound identity is unavailable.
+func (p *Pool) FindConversationAccount(identity string, key []byte) *Account {
+	return p.findIdentityAccount(identity, key, true)
+}
+
+func (p *Pool) findIdentityAccount(identity string, key []byte, configuredPointer bool) *Account {
 	if identity == "" {
 		return nil
 	}
@@ -39,6 +50,9 @@ func (p *Pool) FindImageAccount(identity string, key []byte) *Account {
 		for _, account := range group {
 			if account.Status != StatusActive || ImageIdentity(account, key) != identity {
 				continue
+			}
+			if configuredPointer {
+				return account
 			}
 			snapshot := *account
 			snapshot.Client = nil

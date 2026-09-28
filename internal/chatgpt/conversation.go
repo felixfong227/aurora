@@ -345,7 +345,9 @@ type ContinueInfo struct {
 // HandlerResult 是 HandlerDetailedWithOptions 的返回值。
 type HandlerResult struct {
 	// Err stops callers from emitting a successful completion after recovery fails.
-	Err               error
+	Err error
+	// Completed is proven by an upstream terminal event, never by transport EOF.
+	Completed         bool
 	Text              string
 	ThinkingText      string
 	ConversationID    string
@@ -356,6 +358,7 @@ type HandlerResult struct {
 	PDFArtifacts      []PDFArtifact
 	GeneratedImageIDs []string
 	StopSent          bool
+	DeferredTerminal  *official_types.ChatCompletionChunk
 	Continue          *ContinueInfo
 	ToolCalls         []official_types.ToolCall
 }
