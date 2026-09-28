@@ -1,10 +1,14 @@
 package chatgpt
 
 import (
+	"aurora/httpclient"
 	"aurora/internal/accounts"
+	backendchatgpt "aurora/internal/chatgpt"
 	chatgpt_types "aurora/typings/chatgpt"
 	"aurora/typings/official"
 	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -76,7 +80,7 @@ func TestConvertAPIRequestMapsReasoningEffortToWebEnum(t *testing.T) {
 		effort string
 		want   string
 	}{
-		{name: "default", effort: "", want: "standard"},
+		{name: "default", effort: "", want: ""},
 		{name: "minimal", effort: "minimal", want: "standard"},
 		{name: "low", effort: "low", want: "standard"},
 		{name: "medium", effort: "medium", want: "extended"},
@@ -102,11 +106,10 @@ func TestConvertAPIRequestMapsReasoningEffortToWebEnum(t *testing.T) {
 	}
 }
 
-// 验证 reasoning_effort 也会触发 system_hints:["reason"](不只是模型名)。
+// Auto routing can use effort to select reasoning without overriding explicit models.
 func TestConvertAPIRequestReasoningEffortTriggersSystemHint(t *testing.T) {
-	// high effort + 普通模型名 → 应注入 system_hints
 	out := testConvert(t, official.APIRequest{
-		Model:           "gpt-5-6",
+		Model:           "auto",
 		ReasoningEffort: "high",
 		Messages:        []official.APIMessage{official.NewTextMessage("user", "hi")},
 	})
@@ -118,7 +121,7 @@ func TestConvertAPIRequestReasoningEffortTriggersSystemHint(t *testing.T) {
 	}
 	// extended 也应触发
 	out2 := testConvert(t, official.APIRequest{
-		Model: "gpt-4o-mini", ReasoningEffort: "extended",
+		Model: "", ReasoningEffort: "extended",
 		Messages: []official.APIMessage{official.NewTextMessage("user", "hi")},
 	})
 	if len(out2.SystemHints) != 1 || out2.SystemHints[0] != "reason" {
@@ -131,6 +134,46 @@ func TestConvertAPIRequestReasoningEffortTriggersSystemHint(t *testing.T) {
 	})
 	if len(out3.SystemHints) != 0 {
 		t.Fatalf("no effort: SystemHints = %#v, want empty", out3.SystemHints)
+	}
+}
+
+type conversionCaptureClient struct {
+	httpclient.AuroraHttpClient
+	body []byte
+}
+
+func (c *conversionCaptureClient) Request(_ httpclient.HttpMethod, _ string, _ httpclient.AuroraHeaders, _ []*http.Cookie, body io.Reader) (*http.Response, error) {
+	var err error
+	c.body, err = io.ReadAll(body)
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, err
+}
+
+func TestConvertAPIRequestPreservesExplicitModelAndOptionalEffort(t *testing.T) {
+	for _, model := range []string{"gpt-6-pro", "gpt-5-6-pro", "gpt-5-6", "gpt-4o-mini"} {
+		for effort, want := range map[string]string{"": "", "low": "standard", "medium": "extended", "extended": "extended", "high": "max", "xhigh": "max", "max": "max"} {
+			t.Run(model+"/"+effort, func(t *testing.T) {
+				out := testConvert(t, official.APIRequest{Model: model, ReasoningEffort: effort})
+				// Inspect the actual completion body, including backend sanitization.
+				client := &conversionCaptureClient{}
+				response, err := backendchatgpt.POSTconversationPreparedWithState(client, out, &accounts.Account{Type: accounts.TypePUID}, nil, "", "offline-conduit", "offline-trace", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer response.Body.Close()
+				data := client.body
+				var payload map[string]interface{}
+				if err := json.Unmarshal(data, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload["model"] != model || len(out.SystemHints) != 0 {
+					t.Fatalf("explicit model routing changed: %s", data)
+				}
+				value, present := payload["thinking_effort"]
+				if (want == "" && present) || (want != "" && value != want) {
+					t.Fatalf("thinking_effort = %#v (present %v), want %q", value, present, want)
+				}
+			})
+		}
 	}
 }
 

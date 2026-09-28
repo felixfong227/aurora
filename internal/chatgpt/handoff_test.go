@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"aurora/httpclient"
 	"aurora/internal/httpstream"
@@ -31,6 +32,15 @@ type handoffTestClient struct {
 	getBody           io.ReadCloser
 	conversationReads int
 	imageReads        int
+	ctx               context.Context
+	beforeRead        func()
+	pendingReads      int
+	pendingSnapshot   map[string]interface{}
+}
+
+func (c *handoffTestClient) RequestWithContext(ctx context.Context, method httpclient.HttpMethod, url string, headers httpclient.AuroraHeaders, cookies []*http.Cookie, body io.Reader) (*http.Response, error) {
+	c.ctx = ctx
+	return c.Request(method, url, headers, cookies, body)
 }
 
 func (c *handoffTestClient) Request(method httpclient.HttpMethod, url string, headers httpclient.AuroraHeaders, cookies []*http.Cookie, body io.Reader) (*http.Response, error) {
@@ -40,7 +50,17 @@ func (c *handoffTestClient) Request(method httpclient.HttpMethod, url string, he
 	switch url {
 	case BaseURL + "/conversation/conv-handoff-test":
 		c.conversationReads++
-		if c.conversationReads > 1 {
+		if c.beforeRead != nil {
+			c.beforeRead()
+		}
+		if c.conversationReads <= c.pendingReads {
+			if c.pendingSnapshot != nil {
+				payload, err := json.Marshal(c.pendingSnapshot)
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(payload)))}, err
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"current_node":"pending"}`))}, nil
+		}
+		if c.conversationReads > c.pendingReads+1 {
 			c.t.Fatal("completed snapshot should not require another poll")
 		}
 		if c.getErr != nil {
@@ -103,7 +123,7 @@ func handoffTestSnapshot(t *testing.T, image bool) map[string]interface{} {
 	return snapshot
 }
 
-func runHandoffTestHandler(t *testing.T, client *handoffTestClient, stream bool) (HandlerResult, *httptest.ResponseRecorder, *gin.Context) {
+func runHandoffTestHandler(t *testing.T, client *handoffTestClient, stream bool, suppressOutput ...bool) (HandlerResult, *httptest.ResponseRecorder, *gin.Context) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	request := chatGPTRequestForTest()
@@ -117,8 +137,50 @@ func runHandoffTestHandler(t *testing.T, client *handoffTestClient, stream bool)
 	writer := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(writer)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	result := HandlerDetailedWithOptions(c, response, client, nil, "request-handoff-test", request, stream, "auto", HandlerDetailedOptions{ArtifactDelivery: ArtifactDeliveryURL})
+	options := HandlerDetailedOptions{ArtifactDelivery: ArtifactDeliveryURL}
+	if len(suppressOutput) > 0 {
+		options.SuppressOutput = suppressOutput[0]
+	}
+	result := HandlerDetailedWithOptions(c, response, client, nil, "request-handoff-test", request, stream, "auto", options)
 	return result, writer, c
+}
+
+func TestHandlerHandoffWaitAllowsLongProTurn(t *testing.T) {
+	for _, mode := range []string{"chat_stream", "responses_stream", "nonstream", "responses_error"} {
+		t.Run(mode, func(t *testing.T) {
+			client := &handoffTestClient{t: t, snapshot: handoffTestSnapshot(t, false)}
+			client.beforeRead = func() {
+				deadline, ok := client.ctx.Deadline()
+				if !ok || time.Until(deadline) < 590*time.Second || time.Until(deadline) > 600*time.Second {
+					t.Fatalf("recovery deadline must use the 600-second transport allowance: %v", deadline)
+				}
+			}
+			if mode == "responses_error" {
+				client.getErr = errors.New("synthetic failure")
+			} else {
+				client.pendingReads = 1
+			}
+			result, writer, _ := runHandoffTestHandler(t, client, mode != "nonstream", strings.HasPrefix(mode, "responses"))
+			output := writer.Body.String()
+			if mode == "nonstream" {
+				if output != "" {
+					t.Fatalf("nonstream output changed: %q", output)
+				}
+			} else if strings.Count(output, ": keep-alive\n\n") != client.conversationReads || !writer.Flushed {
+				t.Fatalf("each poll must flush an SSE comment: %q", output)
+			}
+			if strings.HasPrefix(mode, "responses") && strings.Contains(output, "data:") {
+				t.Fatalf("suppressed handler wrote another protocol's events: %q", output)
+			}
+			if mode == "responses_error" {
+				if !errors.Is(result.Err, ErrIncompleteHandoff) {
+					t.Fatalf("failed recovery = %v", result.Err)
+				}
+			} else if result.Text != "A synthetic title" || client.conversationReads != 2 {
+				t.Fatalf("pending turn did not recover: %#v", result)
+			}
+		})
+	}
 }
 
 func TestHandlerRecoversHandoffTitleWithoutWebsocket(t *testing.T) {
@@ -196,12 +258,23 @@ func TestGetCompletedConversationCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	client := &handoffTestClient{t: t, snapshot: handoffTestSnapshot(t, false)}
-	data, err := getCompletedConversation(ctx, client, nil, "conv-handoff-test", handoffTestUserID)
+	data, err := getCompletedConversation(ctx, client, nil, "conv-handoff-test", handoffTestUserID, nil, nil)
 	if !errors.Is(err, context.Canceled) || len(data) != 0 {
 		t.Fatalf("canceled recovery: error=%v data=%s", err, data)
 	}
 	if client.conversationReads != 0 {
 		t.Fatalf("already canceled recovery made %d requests", client.conversationReads)
+	}
+}
+
+func TestGetCompletedConversationCancellationDuringPoll(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &handoffTestClient{t: t, pendingReads: 1, beforeRead: cancel}
+	heartbeats := 0
+	data, err := getCompletedConversation(ctx, client, nil, "conv-handoff-test", handoffTestUserID, func() { heartbeats++ }, nil)
+	if !errors.Is(err, context.Canceled) || len(data) != 0 || client.conversationReads != 1 || heartbeats != 1 {
+		t.Fatalf("cancellation did not stop recovery: err=%v reads=%d heartbeats=%d data=%s", err, client.conversationReads, heartbeats, data)
 	}
 }
 

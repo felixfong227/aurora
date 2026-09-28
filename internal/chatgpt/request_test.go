@@ -999,6 +999,7 @@ func TestConversationCompletionNormalizesThinkingEffort(t *testing.T) {
 		input string
 		want  string
 	}{
+		{input: "", want: ""},
 		{input: "low", want: "standard"},
 		{input: "medium", want: "extended"},
 		{input: "high", want: "max"},
@@ -1023,7 +1024,11 @@ func TestConversationCompletionNormalizesThinkingEffort(t *testing.T) {
 			if err := json.Unmarshal([]byte(client.body), &payload); err != nil {
 				t.Fatalf("completion body is invalid json: %v", err)
 			}
-			if payload["thinking_effort"] != tt.want {
+			if tt.want == "" {
+				if _, present := payload["thinking_effort"]; present {
+					t.Fatalf("unspecified thinking_effort must be omitted: %s", client.body)
+				}
+			} else if payload["thinking_effort"] != tt.want {
 				t.Fatalf("thinking_effort = %#v, want %q", payload["thinking_effort"], tt.want)
 			}
 		})

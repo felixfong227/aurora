@@ -249,7 +249,9 @@ func sanitizeConversationCompletionRequest(message chatgpt_types.ChatGPTRequest)
 
 func normalizeThinkingEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "", "none", "minimal", "low", "standard":
+	case "":
+		return ""
+	case "none", "minimal", "low", "standard":
 		return "standard"
 	case "medium", "extended":
 		return "extended"

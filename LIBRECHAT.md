@@ -9,6 +9,22 @@ This fork fixes two failures in the ChatGPT-backed chat-completions path:
 - Generated images could appear only in custom metadata that LibreChat ignores.
   The final image now also appears as ordinary Markdown before the response ends.
 
+## Pro models, reasoning and sources
+
+Explicit model IDs stay selected when reasoning effort changes. Only the existing
+thinking aliases use the `auto`/`reason` translation. If no effort is supplied,
+Aurora leaves it unset rather than forcing `standard`, so the backend chooses
+the model's default.
+
+Background-turn recovery allows up to ten minutes and sends SSE keep-alive
+comments while waiting. Public thought summaries, reasoning recap labels and
+observed web-search activity are forwarded as reasoning content. Detailed private
+thought content is not forwarded by this summary path. Complete responses and
+recovered snapshots retain the same citation links as streamed reference patches.
+
+This does not force a web search or guarantee identical website answers. It
+preserves the settings and user-visible information available from the backend.
+
 ## Images without local file storage
 
 Use a versioned image from `ghcr.io/felixfong227/aurora` and add this to the
@@ -44,7 +60,7 @@ It supports configured accounts, not temporary externally supplied tokens.
 - It does not map successive LibreChat turns to the same ChatGPT conversation.
 - Partial answers and `continue` handoffs fail explicitly rather than replaying
   content already delivered.
-- No model routing or usage/billing policy is changed.
+- No usage/billing policy is enforced by these compatibility fixes.
 
 ## Publishing
 

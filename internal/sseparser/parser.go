@@ -408,6 +408,7 @@ func ApplyPatch(state *PatchState, patchPath string, operation string, value int
 				state.Response.ConversationID = response.ConversationID
 			}
 			state.Response.Message = response.Message
+			RecordContentReferences(state, response.Message.Metadata.ContentReferences)
 		}
 		if channel := ChannelFromValue(value); channel != "" {
 			state.Channel = channel
@@ -433,6 +434,11 @@ func ApplyPatch(state *PatchState, patchPath string, operation string, value int
 	case patchPath == "/message/content/content_type":
 		if text, ok := value.(string); ok {
 			state.Response.Message.Content.ContentType = text
+		}
+	case patchPath == "/message/content":
+		data, err := json.Marshal(value)
+		if err != nil || json.Unmarshal(data, &state.Response.Message.Content) != nil {
+			return false
 		}
 	case patchPath == "/message/content/parts":
 		if parts, ok := value.([]interface{}); ok {
@@ -495,18 +501,20 @@ func applyContentReferencePatch(state *PatchState, patchPath string, operation s
 
 	switch {
 	case patchPath == "/message/metadata/content_references":
+		if operation == "replace" {
+			resetReferenceSlots(state)
+		}
 		// append 引用对象或对象数组: {"matched_text":"...", "alt":"..."}
 		// 对象字段后续还会通过 /N/matched_text append 增量到达,
 		// 所以这里同时记录 partial 值作为拼接起点。
 		switch v := value.(type) {
 		case map[string]interface{}:
-			recordRefObject(state, v)
+			recordRefObject(state, v, state.nextRefIdx)
 			return true
 		case []interface{}:
 			for _, item := range v {
-				if obj, ok := item.(map[string]interface{}); ok {
-					recordRefObject(state, obj)
-				}
+				obj, _ := item.(map[string]interface{})
+				recordRefObject(state, obj, state.nextRefIdx)
 			}
 			return true
 		}
@@ -545,24 +553,61 @@ func applyContentReferencePatch(state *PatchState, patchPath string, operation s
 	default:
 		// 整个引用对象的 append/replace: .../content_references/N 或带其他后缀的对象值
 		if obj, ok := value.(map[string]interface{}); ok {
-			recordRefObject(state, obj)
+			idx := contentRefIndex(patchPath)
+			if idx < 0 {
+				return false
+			}
+			if operation == "replace" {
+				delete(state.CiteAlts, fmt.Sprintf("ref:%d:matched", idx))
+				delete(state.CiteAlts, fmt.Sprintf("ref:%d:alt", idx))
+			}
+			recordRefObject(state, obj, idx)
 			return true
 		}
 	}
 	return false
 }
 
+// Complete messages and history snapshots carry the same references as patches.
+func RecordContentReferences(state *PatchState, references []chatgpt_types.ContentReference) {
+	if references == nil {
+		return
+	}
+	if state.CiteAlts == nil {
+		state.CiteAlts = make(map[string]string)
+	}
+	resetReferenceSlots(state)
+	for index, reference := range references {
+		recordRefObject(state, map[string]interface{}{
+			"matched_text": reference.MatchedText, "alt": reference.Alt,
+		}, index)
+	}
+}
+
+func resetReferenceSlots(state *PatchState) {
+	for key := range state.CiteAlts {
+		if strings.HasPrefix(key, "ref:") {
+			delete(state.CiteAlts, key)
+		}
+	}
+	state.nextRefIdx = 0
+}
+
 // recordRefObject 记录一个 content_references 引用对象:
 // 1. matched_text 作为 ref:N:matched 的拼接起点
 // 2. matched 和 alt 都非空时建立最终映射
-func recordRefObject(state *PatchState, obj map[string]interface{}) {
-	matched, _ := obj["matched_text"].(string)
-	alt, _ := obj["alt"].(string)
-	if matched != "" {
-		idx := state.nextRefIdx
-		state.nextRefIdx++
+func recordRefObject(state *PatchState, obj map[string]interface{}, idx int) {
+	if idx >= state.nextRefIdx {
+		state.nextRefIdx = idx + 1
+	}
+	if matched, ok := obj["matched_text"].(string); ok {
 		state.CiteAlts[fmt.Sprintf("ref:%d:matched", idx)] = matched
 	}
+	if alt, ok := obj["alt"].(string); ok {
+		state.CiteAlts[fmt.Sprintf("ref:%d:alt", idx)] = alt
+	}
+	matched := state.CiteAlts[fmt.Sprintf("ref:%d:matched", idx)]
+	alt := state.CiteAlts[fmt.Sprintf("ref:%d:alt", idx)]
 	if matched != "" && alt != "" {
 		state.CiteAlts[matched] = alt
 	}

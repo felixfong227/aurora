@@ -21,8 +21,20 @@ type Message struct {
 }
 
 type Content struct {
-	ContentType string        `json:"content_type"`
-	Parts       []interface{} `json:"parts"`
+	ContentType string           `json:"content_type"`
+	Parts       []interface{}    `json:"parts"`
+	Thoughts    []ThoughtSummary `json:"thoughts,omitempty"`
+	Recap       string           `json:"content,omitempty"`
+}
+
+// Only the public heading is decoded, never detailed thought content or chunks.
+type ThoughtSummary struct {
+	Summary string `json:"summary"`
+}
+
+type ContentReference struct {
+	MatchedText string `json:"matched_text"`
+	Alt         string `json:"alt"`
 }
 
 type Author struct {
@@ -32,11 +44,12 @@ type Author struct {
 }
 
 type Metadata struct {
-	Timestamp     string         `json:"timestamp_"`
-	Citations     []Citation     `json:"citations,omitempty"`
-	MessageType   string         `json:"message_type"`
-	FinishDetails *FinishDetails `json:"finish_details"`
-	ModelSlug     string         `json:"model_slug"`
+	Timestamp         string             `json:"timestamp_"`
+	Citations         []Citation         `json:"citations,omitempty"`
+	MessageType       string             `json:"message_type"`
+	FinishDetails     *FinishDetails     `json:"finish_details"`
+	ModelSlug         string             `json:"model_slug"`
+	ContentReferences []ContentReference `json:"content_references,omitempty"`
 	// IsThinkingPreambleMessage 标记"思考前导"消息(新版 SSE)。
 	// 这类消息是 assistant 在正式回答前的引导语,不应输出给用户。
 	IsThinkingPreambleMessage bool `json:"is_thinking_preamble_message,omitempty"`

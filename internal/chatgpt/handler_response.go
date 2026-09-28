@@ -68,6 +68,7 @@ func parseConversationEvent(line string, state *sseparser.PatchState, model stri
 	if err := json.Unmarshal([]byte(line), &direct); err == nil && sseparser.IsUsableConversationResponse(direct) {
 		channel := sseparser.ChannelFromValue(raw)
 		state.Channel = firstNonEmpty(channel, state.Channel)
+		sseparser.RecordContentReferences(state, direct.Message.Metadata.ContentReferences)
 		return conversationStreamEvent{response: direct, messageID: direct.Message.ID, channel: state.Channel}, true
 	}
 
@@ -76,6 +77,7 @@ func parseConversationEvent(line string, state *sseparser.PatchState, model stri
 			sseparser.ResetMessage(state)
 		}
 		state.Response = response
+		sseparser.RecordContentReferences(state, response.Message.Metadata.ContentReferences)
 		if channel := sseparser.ChannelFromValue(raw["v"]); channel != "" {
 			state.Channel = channel
 		}
@@ -280,6 +282,43 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 			c.Writer.Flush()
 		}
 	}
+	publicSummaries := make(map[string]string)
+	emitSummary := func(key, text string) {
+		if text == "" || publicSummaries[key] == text {
+			return
+		}
+		previous := publicSummaries[key]
+		if previous == "" && thinkingText != "" {
+			emitThinking("\n\n")
+		}
+		emitThinking(sseparser.NormalizeContentDelta(previous, text))
+		publicSummaries[key] = text
+	}
+	emitPublicActivity := func(message chatgpt_types.Message) bool {
+		if message.Author.Role == "assistant" {
+			switch message.Content.ContentType {
+			case "thoughts":
+				for index, thought := range message.Content.Thoughts {
+					emitSummary(fmt.Sprintf("%s:thought:%d", message.ID, index), thought.Summary)
+				}
+				return true
+			case "reasoning_recap":
+				emitSummary(message.ID+":recap", message.Content.Recap)
+				return true
+			}
+		}
+		name, _ := message.Author.Name.(string)
+		isWeb := func(value string) bool {
+			return value == "web" || value == "browser" ||
+				strings.HasPrefix(value, "web.") || strings.HasPrefix(value, "browser.")
+		}
+		if (message.Author.Role == "assistant" && isWeb(message.Recipient)) ||
+			(message.Author.Role == "tool" && isWeb(name)) {
+			// This describes an upstream operation, not a downstream tool call.
+			emitSummary("web-activity", "Searching the web.")
+		}
+		return false
+	}
 	finalizeArtifacts := func() {
 		emitSentinels(materializeArtifactEvents(client, account, convId, artifactState.Finalize(), artifactConfig))
 		if markdown := finalGeneratedImageMarkdown(sentinel, renderedImageFiles); markdown != "" {
@@ -326,7 +365,8 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 		if c.Request != nil {
 			ctx = c.Request.Context()
 		}
-		ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		// Match the transport's allowance for long-running background turns.
+		ctx, cancel := context.WithTimeout(ctx, 600*time.Second)
 		defer cancel()
 		expectedUserID := ""
 		for i := len(translated_request.Messages) - 1; i >= 0; i-- {
@@ -335,7 +375,24 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 				break
 			}
 		}
-		body, err := getCompletedConversation(ctx, client, account, convId, expectedUserID)
+		var beforePoll func()
+		if stream {
+			// Comments keep both Chat Completions and Responses streams alive
+			// without inventing reasoning or writing the caller's protocol.
+			beforePoll = func() {
+				c.Writer.WriteString(": keep-alive\n\n")
+				c.Writer.Flush()
+			}
+		}
+		onProgress := func(body []byte) {
+			for _, payload := range sseparser.DataPayloads(string(body)) {
+				var response chatgpt_types.ChatGPTResponse
+				if json.Unmarshal([]byte(payload), &response) == nil {
+					emitPublicActivity(response.Message)
+				}
+			}
+		}
+		body, err := getCompletedConversation(ctx, client, account, convId, expectedUserID, beforePoll, onProgress)
 		if err != nil {
 			return false
 		}
@@ -577,6 +634,10 @@ readLoop:
 			}
 			if original_response.Message.ID != "" && (original_response.Message.Author.Role == "assistant" || original_response.Message.Author.Role == "tool") {
 				assistantMessageID = original_response.Message.ID
+			}
+			if emitPublicActivity(original_response.Message) {
+				currentEvent = ""
+				continue
 			}
 			if activeChannel == "analysis" {
 				thinkingDelta := sseparser.NormalizeContentDelta(thinkingText, sseparser.FirstStringPart(original_response.Message.Content.Parts))

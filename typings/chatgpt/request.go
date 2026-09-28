@@ -43,7 +43,7 @@ type ChatGPTRequest struct {
 	HistoryAndTrainingDisabled       bool                   `json:"history_and_training_disabled,omitempty"`
 	ParagenCotSummaryDisplayOverride string                 `json:"paragen_cot_summary_display_override"`
 	ForceParallelSwitch              string                 `json:"force_parallel_switch"`
-	ThinkingEffort                   string                 `json:"thinking_effort"`
+	ThinkingEffort                   string                 `json:"thinking_effort,omitempty"`
 	ForceRateLimit                   bool                   `json:"force_rate_limit,omitempty"`
 	ResetRateLimits                  bool                   `json:"reset_rate_limits,omitempty"`
 	ForceUseSse                      bool                   `json:"force_use_sse,omitempty"`
@@ -65,7 +65,6 @@ func NewChatGPTRequest() ChatGPTRequest {
 		// /f/conversation/prepare 的协议字段由 prepare 请求单独构造。
 		ParagenCotSummaryDisplayOverride: "allow",
 		ForceParallelSwitch:              "auto",
-		ThinkingEffort:                   "standard",
 	}
 }
 
