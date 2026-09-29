@@ -838,9 +838,10 @@ func TestRequiresConversationWebsocket(t *testing.T) {
 		{name: "non-streaming standard", thinkingEffort: "standard", want: false},
 		{name: "non-streaming low normalizes to standard", thinkingEffort: "low", want: false},
 		{name: "non-streaming extended", thinkingEffort: "extended", want: true},
-		{name: "non-streaming medium normalizes to extended", thinkingEffort: "medium", want: true},
+		{name: "non-streaming medium normalizes to standard", thinkingEffort: "medium", want: false},
 		{name: "non-streaming max", thinkingEffort: "max", want: true},
-		{name: "non-streaming high normalizes to max", thinkingEffort: "high", want: true},
+		{name: "non-streaming high normalizes to extended", thinkingEffort: "high", want: true},
+		{name: "non-streaming xhigh normalizes to max", thinkingEffort: "xhigh", want: true},
 	}
 
 	for _, tt := range tests {
@@ -1001,8 +1002,12 @@ func TestConversationCompletionNormalizesThinkingEffort(t *testing.T) {
 	}{
 		{input: "", want: ""},
 		{input: "low", want: "standard"},
-		{input: "medium", want: "extended"},
-		{input: "high", want: "max"},
+		{input: "medium", want: "standard"},
+		{input: "high", want: "extended"},
+		{input: "xhigh", want: "max"},
+		{input: "standard", want: "standard"},
+		{input: "extended", want: "extended"},
+		{input: "max", want: "max"},
 		{input: "turbo", want: "standard"},
 	} {
 		t.Run(tt.input, func(t *testing.T) {

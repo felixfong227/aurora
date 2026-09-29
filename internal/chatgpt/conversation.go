@@ -243,19 +243,21 @@ func sanitizeConversationCompletionRequest(message chatgpt_types.ChatGPTRequest)
 	message.SupportsBuffering = false
 	message.SupportedEncodings = nil
 	message.ClientContextualInfo = nil
-	message.ThinkingEffort = normalizeThinkingEffort(message.ThinkingEffort)
+	message.ThinkingEffort = NormalizeThinkingEffort(message.ThinkingEffort)
 	return message
 }
 
-func normalizeThinkingEffort(effort string) string {
+// NormalizeThinkingEffort maps medium/high/xhigh to the website's distinct
+// Standard/Extended/Heavy levels. An omitted effort stays omitted.
+func NormalizeThinkingEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "":
 		return ""
-	case "none", "minimal", "low", "standard":
+	case "none", "minimal", "low", "medium", "standard":
 		return "standard"
-	case "medium", "extended":
+	case "high", "extended":
 		return "extended"
-	case "high", "xhigh", "max":
+	case "xhigh", "max":
 		return "max"
 	default:
 		return "standard"

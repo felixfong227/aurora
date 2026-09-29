@@ -11,10 +11,16 @@ This fork fixes two failures in the ChatGPT-backed chat-completions path:
 
 ## Pro models, reasoning and sources
 
-Explicit model IDs stay selected when reasoning effort changes. Only the existing
-thinking aliases use the `auto`/`reason` translation. If no effort is supplied,
-Aurora leaves it unset rather than forcing `standard`, so the backend chooses
-the model's default.
+Explicit model IDs stay selected when reasoning effort changes, including the
+advertised thinking models. A `reason` hint does not replace the selected model
+with `auto`. If no effort is supplied, Aurora leaves it unset rather than forcing
+`standard`, so the backend chooses the model's default.
+
+For `gpt-5-6-thinking`, API effort levels `medium`, `high`, and `xhigh` map to
+ChatGPT's `standard`, `extended`, and `max` respectively. Those are distinct
+Standard, Extended, and Heavy choices in the website model catalog. Both request
+conversion and final serialization use the same mapping. This translates API
+names; it does not guarantee that every model supports every effort level.
 
 Background-turn recovery allows up to ten minutes and sends SSE keep-alive
 comments while waiting. Public thought summaries, reasoning recap labels and

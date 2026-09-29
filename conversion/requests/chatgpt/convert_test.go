@@ -34,7 +34,7 @@ func TestConvertAPIRequestNoToolsNoInjection(t *testing.T) {
 	}
 }
 
-func TestConvertAPIRequestRoutesThinkingAliasThroughReasonHint(t *testing.T) {
+func TestConvertAPIRequestKeepsThinkingModelWithReasonHint(t *testing.T) {
 	for _, model := range []string{"gpt-5-6-t-mini", "gpt-5-6-thinking"} {
 		t.Run(model, func(t *testing.T) {
 			out := testConvert(t, official.APIRequest{
@@ -42,8 +42,8 @@ func TestConvertAPIRequestRoutesThinkingAliasThroughReasonHint(t *testing.T) {
 				Messages: []official.APIMessage{official.NewTextMessage("user", "hi")},
 			})
 
-			if out.Model != "auto" {
-				t.Fatalf("Model = %q, want auto", out.Model)
+			if out.Model != model {
+				t.Fatalf("Model = %q, want requested model %q", out.Model, model)
 			}
 			if len(out.SystemHints) != 1 || out.SystemHints[0] != "reason" {
 				t.Fatalf("SystemHints = %#v, want [reason]", out.SystemHints)
@@ -83,10 +83,10 @@ func TestConvertAPIRequestMapsReasoningEffortToWebEnum(t *testing.T) {
 		{name: "default", effort: "", want: ""},
 		{name: "minimal", effort: "minimal", want: "standard"},
 		{name: "low", effort: "low", want: "standard"},
-		{name: "medium", effort: "medium", want: "extended"},
+		{name: "medium", effort: "medium", want: "standard"},
 		{name: "standard", effort: "standard", want: "standard"},
 		{name: "extended", effort: "extended", want: "extended"},
-		{name: "high", effort: "high", want: "max"},
+		{name: "high", effort: "high", want: "extended"},
 		{name: "xhigh", effort: "xhigh", want: "max"},
 		{name: "max", effort: "max", want: "max"},
 		{name: "unknown", effort: "turbo", want: "standard"},
@@ -149,8 +149,8 @@ func (c *conversionCaptureClient) Request(_ httpclient.HttpMethod, _ string, _ h
 }
 
 func TestConvertAPIRequestPreservesExplicitModelAndOptionalEffort(t *testing.T) {
-	for _, model := range []string{"gpt-6-pro", "gpt-5-6-pro", "gpt-5-6", "gpt-4o-mini"} {
-		for effort, want := range map[string]string{"": "", "low": "standard", "medium": "extended", "extended": "extended", "high": "max", "xhigh": "max", "max": "max"} {
+	for _, model := range []string{"gpt-6-pro", "gpt-5-6-pro", "gpt-5-6", "gpt-4o-mini", "gpt-5-5-thinking", "gpt-5-6-thinking", "gpt-5-6-t-mini"} {
+		for effort, want := range map[string]string{"": "", "low": "standard", "medium": "standard", "extended": "extended", "high": "extended", "xhigh": "max", "max": "max"} {
 			t.Run(model+"/"+effort, func(t *testing.T) {
 				out := testConvert(t, official.APIRequest{Model: model, ReasoningEffort: effort})
 				// Inspect the actual completion body, including backend sanitization.
@@ -165,7 +165,7 @@ func TestConvertAPIRequestPreservesExplicitModelAndOptionalEffort(t *testing.T) 
 				if err := json.Unmarshal(data, &payload); err != nil {
 					t.Fatal(err)
 				}
-				if payload["model"] != model || len(out.SystemHints) != 0 {
+				if payload["model"] != model {
 					t.Fatalf("explicit model routing changed: %s", data)
 				}
 				value, present := payload["thinking_effort"]
