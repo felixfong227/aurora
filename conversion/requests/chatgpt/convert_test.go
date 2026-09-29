@@ -34,24 +34,25 @@ func TestConvertAPIRequestNoToolsNoInjection(t *testing.T) {
 	}
 }
 
-func TestConvertAPIRequestKeepsThinkingModelWithReasonHint(t *testing.T) {
+// chatgpt.com sends no system_hints for a selected thinking model; "reason"
+// there yields a fast answer with no thoughts, search, or citations.
+func TestConvertAPIRequestKeepsThinkingModelWithoutReasonHint(t *testing.T) {
 	for _, model := range []string{"gpt-5-6-t-mini", "gpt-5-6-thinking"} {
 		t.Run(model, func(t *testing.T) {
 			out := testConvert(t, official.APIRequest{
-				Model:    model,
-				Messages: []official.APIMessage{official.NewTextMessage("user", "hi")},
+				Model:           model,
+				ReasoningEffort: "xhigh",
+				Messages:        []official.APIMessage{official.NewTextMessage("user", "hi")},
 			})
 
-			if out.Model != model {
-				t.Fatalf("Model = %q, want requested model %q", out.Model, model)
+			if out.Model != model || out.ThinkingEffort != "max" {
+				t.Fatalf("Model/effort = %q/%q, want %q/max", out.Model, out.ThinkingEffort, model)
 			}
-			if len(out.SystemHints) != 1 || out.SystemHints[0] != "reason" {
-				t.Fatalf("SystemHints = %#v, want [reason]", out.SystemHints)
+			if len(out.SystemHints) != 0 {
+				t.Fatalf("SystemHints = %#v, want none", out.SystemHints)
 			}
-			metadata := out.Messages[0].Metadata
-			hints, ok := metadata["system_hints"].([]string)
-			if !ok || len(hints) != 1 || hints[0] != "reason" {
-				t.Fatalf("message system_hints = %#v, want [reason]", metadata["system_hints"])
+			if hints, ok := out.Messages[0].Metadata["system_hints"]; ok {
+				t.Fatalf("message system_hints = %#v, want absent", hints)
 			}
 		})
 	}

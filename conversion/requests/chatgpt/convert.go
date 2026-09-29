@@ -154,13 +154,11 @@ func ConvertAPIRequest(api_request official_types.APIRequest, account *accounts.
 }
 
 // usesReasonSystemHint 判断是否应向上游注入 system_hints:["reason"] 开启思考模式。
-// The hint is independent of model selection.
+// Only auto routing uses it; chatgpt.com sends no hints for an explicitly
+// selected thinking model, and adding "reason" there skips its reasoning/tools.
 func usesReasonSystemHint(model string, reasoningEffort string) bool {
 	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "gpt-5-6-t-mini", "gpt-5-6-thinking":
-		return true
 	case "", "auto":
-		// Explicit effort may select reasoning for auto routing.
 	default:
 		return false
 	}
