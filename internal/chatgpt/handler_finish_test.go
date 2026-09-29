@@ -10,9 +10,37 @@ import (
 	"testing"
 
 	"aurora/internal/httpstream"
+	"aurora/internal/sseparser"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestHandlerDefersOnlyTerminal(t *testing.T) {
+	for _, frame := range []string{
+		`{"conversation_id":"conv-test","message":{"id":"msg-test","author":{"role":"assistant"},"recipient":"all","content":{"content_type":"text","parts":["hello"]},"end_turn":true,"metadata":{"message_type":"next"}}}`,
+		`{"object":"chat.completion.chunk","conversation_id":"conv-test","choices":[{"delta":{"content":"hello","role":"assistant"},"index":0,"finish_reason":"stop"}]}`,
+		`{"object":"chat.completion.chunk","conversation_id":"conv-test","channel":"analysis","choices":[{"delta":{"content":"hello","role":"assistant"},"index":0,"finish_reason":"stop"}]}`,
+	} {
+		t.Run(frame, func(t *testing.T) {
+			response := &http.Response{Body: io.NopCloser(strings.NewReader("data: " + frame + "\n\ndata: [DONE]\n\n"))}
+			writer := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(writer)
+			result := HandlerDetailedWithOptions(c, response, nil, nil, "request-id", chatGPTRequestForTest(), true, "auto", HandlerDetailedOptions{DeferTerminal: true})
+			if result.Err != nil || result.StopSent || result.DeferredTerminal == nil {
+				t.Fatalf("terminal not deferred: %+v", result)
+			}
+			if sseparser.ChunkFinishReason(*result.DeferredTerminal) != "stop" {
+				t.Fatal("deferred finish reason changed")
+			}
+			if !strings.Contains(writer.Body.String(), "hello") {
+				t.Fatalf("nonterminal output was buffered: %s", writer.Body.String())
+			}
+			if strings.Contains(writer.Body.String(), `"finish_reason":"stop"`) || strings.Contains(writer.Body.String(), "[DONE]") {
+				t.Fatalf("terminal leaked before caller commit: %s", writer.Body.String())
+			}
+		})
+	}
+}
 
 func TestHandlerWaitsForTrueEndTurn(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -48,6 +76,9 @@ func TestHandlerWaitsForTrueEndTurn(t *testing.T) {
 
 					if result.Text != "hello world" {
 						t.Fatalf("text = %q, want complete answer", result.Text)
+					}
+					if !result.Completed {
+						t.Fatal("terminal upstream event did not prove completion")
 					}
 					if result.Continue != nil {
 						t.Fatalf("Continue = %#v, want nil", result.Continue)
@@ -114,6 +145,9 @@ func TestHandlerCompletesWithValidFinishReason(t *testing.T) {
 			if !result.StopSent {
 				t.Fatal("StopSent = false after completed turn")
 			}
+			if result.Completed != (tc.want != "length") {
+				t.Fatalf("Completed = %t for finish reason %s", result.Completed, tc.want)
+			}
 			httpstream.WriteChatCompletionDone(c, result.StopSent, "auto", result.ConversationID)
 			assertCompletedChatStream(t, writer.Body.String(), "hello world", tc.want)
 		})
@@ -142,6 +176,9 @@ func TestHandlerMaxTokensPreservesContinuation(t *testing.T) {
 				}
 				if result.StopSent {
 					t.Fatal("StopSent = true before continuation")
+				}
+				if result.Completed {
+					t.Fatal("partial completion was marked safe to checkpoint")
 				}
 				for _, chunk := range parseSSEChunks(t, writer.Body.String()) {
 					choice := chunk["choices"].([]interface{})[0].(map[string]interface{})

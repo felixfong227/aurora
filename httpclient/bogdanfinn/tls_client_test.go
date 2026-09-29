@@ -3,13 +3,17 @@ package bogdanfinn
 import (
 	"aurora/httpclient"
 	chatgpt_types "aurora/typings/chatgpt"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -103,4 +107,42 @@ func TestChatGPTModel(t *testing.T) {
 	}
 	json.NewDecoder(response.Body).Decode(&result)
 	fmt.Println(result)
+}
+
+func TestTlsClientRequestWithContextCancelsInFlight(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		response, err := NewStdClient().RequestWithContext(ctx, httpclient.GET, server.URL, nil, nil, nil)
+		if response != nil {
+			response.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request ignored cancellation")
+	}
 }

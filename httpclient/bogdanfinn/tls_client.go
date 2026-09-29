@@ -2,6 +2,7 @@ package bogdanfinn
 
 import (
 	"aurora/httpclient"
+	"context"
 	"io"
 	"net/http"
 	"net/url"
@@ -79,7 +80,11 @@ func (t *TlsClient) handleCookies(req *fhttp.Request, cookies []*http.Cookie) {
 }
 
 func (t *TlsClient) Request(method httpclient.HttpMethod, url string, headers httpclient.AuroraHeaders, cookies []*http.Cookie, body io.Reader) (*http.Response, error) {
-	req, err := fhttp.NewRequest(string(method), url, body)
+	return t.RequestWithContext(context.Background(), method, url, headers, cookies, body)
+}
+
+func (t *TlsClient) RequestWithContext(ctx context.Context, method httpclient.HttpMethod, url string, headers httpclient.AuroraHeaders, cookies []*http.Cookie, body io.Reader) (*http.Response, error) {
+	req, err := fhttp.NewRequestWithContext(ctx, string(method), url, body)
 	if err != nil {
 		return nil, err
 	}

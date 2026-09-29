@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 
@@ -45,6 +46,11 @@ func materializeGeneratedImageEvent(client httpclient.AuroraHttpClient, account 
 	if cfg.Delivery == ArtifactDeliveryURL {
 		if url, err := ResolveGeneratedImageURL(client, account, conversationID, ev.FileID); err == nil {
 			ev.URL = url
+			if ImageProxyURL != nil {
+				if proxyURL := ImageProxyURL(account, ev.FileID); proxyURL != "" {
+					ev.URL = proxyURL
+				}
+			}
 		} else {
 			ev.Error = err.Error()
 		}
@@ -95,6 +101,42 @@ func materializeSandboxEvent(client httpclient.AuroraHttpClient, account *accoun
 		ev.MimeType = mimeType
 	}
 	return materializeBytes(ev, data, cfg)
+}
+
+// finalGeneratedImageMarkdown exposes final images to ordinary chat-completion
+// clients, which do not understand Sentinel events. Keep previews and superseded
+// revisions in Sentinel only, and do not repeat images emitted by the legacy path.
+func finalGeneratedImageMarkdown(events []map[string]interface{}, rendered map[string]bool) string {
+	urls := make(map[string]string)
+	for _, event := range events {
+		if event["kind"] != "generated_image" || event["event"] != StreamEventArtifact {
+			continue
+		}
+		fileID, _ := event["file_id"].(string)
+		imageURL, _ := event["url"].(string)
+		if fileID != "" && imageURL != "" {
+			urls[fileID] = imageURL
+		}
+	}
+	var markdown strings.Builder
+	for _, event := range events {
+		if event["kind"] != "generated_image" || event["event"] != StreamEventArtifactSlotFinal {
+			continue
+		}
+		fileID, _ := event["file_id"].(string)
+		if fileID == "" || rendered[fileID] {
+			continue
+		}
+		imageURL, err := url.Parse(urls[fileID])
+		if err != nil || imageURL.Host == "" || (imageURL.Scheme != "https" && imageURL.Scheme != "http") {
+			continue
+		}
+		// Escape Markdown delimiters without changing the signed URL's query.
+		target := strings.NewReplacer("(", "%28", ")", "%29", "<", "%3C", ">", "%3E").Replace(imageURL.String())
+		fmt.Fprintf(&markdown, "\n\n![Generated image](%s)\n", target)
+		rendered[fileID] = true
+	}
+	return markdown.String()
 }
 
 func materializeBytes(ev StreamEvent, data []byte, cfg ArtifactStreamConfig) []map[string]interface{} {

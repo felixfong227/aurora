@@ -13,7 +13,7 @@
 ARG GO_VERSION=1.26.0
 
 # ---- 阶段 1: 编译 ----
-FROM golang:${GO_VERSION}-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 
 # 1) 先拷贝 module 清单(几乎不变,缓存命中率最高)
@@ -41,6 +41,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # ---- 阶段 2: 运行镜像(distroless,~2MB,无 shell 更安全)----
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/aurora /aurora
+# Token files in the supplied Compose configuration are mounted at /.
+WORKDIR /
 EXPOSE 8080
 USER nonroot:nonroot
 ENTRYPOINT ["/aurora"]

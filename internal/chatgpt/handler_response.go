@@ -2,6 +2,8 @@ package chatgpt
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,12 +12,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"aurora/conversion/response/chatgpt"
 	"aurora/httpclient"
 	"aurora/internal/accounts"
+	"aurora/internal/httpstream"
 	"aurora/internal/sseparser"
 	"aurora/typings"
 	chatgpt_types "aurora/typings/chatgpt"
@@ -64,6 +68,7 @@ func parseConversationEvent(line string, state *sseparser.PatchState, model stri
 	if err := json.Unmarshal([]byte(line), &direct); err == nil && sseparser.IsUsableConversationResponse(direct) {
 		channel := sseparser.ChannelFromValue(raw)
 		state.Channel = firstNonEmpty(channel, state.Channel)
+		sseparser.RecordContentReferences(state, direct.Message.Metadata.ContentReferences)
 		return conversationStreamEvent{response: direct, messageID: direct.Message.ID, channel: state.Channel}, true
 	}
 
@@ -72,6 +77,7 @@ func parseConversationEvent(line string, state *sseparser.PatchState, model stri
 			sseparser.ResetMessage(state)
 		}
 		state.Response = response
+		sseparser.RecordContentReferences(state, response.Message.Metadata.ContentReferences)
 		if channel := sseparser.ChannelFromValue(raw["v"]); channel != "" {
 			state.Channel = channel
 		}
@@ -136,6 +142,10 @@ func parseConversationEvent(line string, state *sseparser.PatchState, model stri
 // Handler 处理对话响应（简化版）。
 func Handler(c *gin.Context, response *http.Response, client httpclient.AuroraHttpClient, account *accounts.Account, uuid string, translated_request chatgpt_types.ChatGPTRequest, stream bool, model string) (string, *ContinueInfo) {
 	result := HandlerDetailed(c, response, client, account, uuid, translated_request, stream, model)
+	if result.Err != nil {
+		httpstream.WriteChatCompletionError(c, result.Err)
+		return "", nil
+	}
 	return result.Text, result.Continue
 }
 
@@ -157,10 +167,12 @@ type HandlerDetailedOptions struct {
 	ProxyURL         string
 	Tools            []official_types.Tool
 	SuppressOutput   bool
+	// DeferTerminal lets the caller durably checkpoint before reporting success.
+	DeferTerminal bool
 }
 
 // HandlerDetailedWithOptions 处理对话响应流（最完整版）。
-func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client httpclient.AuroraHttpClient, account *accounts.Account, uuid string, translated_request chatgpt_types.ChatGPTRequest, stream bool, model string, options HandlerDetailedOptions) HandlerResult {
+func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client httpclient.AuroraHttpClient, account *accounts.Account, uuid string, translated_request chatgpt_types.ChatGPTRequest, stream bool, model string, options HandlerDetailedOptions) (result HandlerResult) {
 	if model == "" {
 		model = translated_request.Model
 	}
@@ -196,12 +208,31 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 	var finish_reason string
 	var previous_text typings.StringStruct
 	var visibleText strings.Builder
+	var generatedImageText strings.Builder
 	var usedChunkEvents bool
 	var original_response chatgpt_types.ChatGPTResponse
 	var isRole = true
 	var waitSource = false
 	var isEnd = false
+	var deferredTerminal *official_types.ChatCompletionChunk
+	emitTerminal := func(chunk official_types.ChatCompletionChunk) {
+		if options.DeferTerminal {
+			deferredTerminal = &chunk
+			return
+		}
+		c.Writer.WriteString("data: " + chunk.String() + "\n\n")
+		c.Writer.Flush()
+	}
+	defer func() {
+		result.Completed = result.Err == nil && isEnd && !max_tokens && finish_reason != "length" &&
+			result.ConversationID != "" && result.ParentMessageID != ""
+		result.DeferredTerminal = deferredTerminal
+		if deferredTerminal != nil {
+			result.StopSent = false
+		}
+	}()
 	var imgSource []string
+	renderedImageFiles := make(map[string]bool)
 	var convId string
 	var sentinel []map[string]interface{}
 	var thinkingText string
@@ -214,6 +245,7 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 	var handoffTopicID string
 	var currentEvent string
 	var readingWebsocket bool
+	var readingSnapshot bool
 	var websocketStream io.ReadCloser
 	emitSentinels := func(items []map[string]interface{}) {
 		if len(items) == 0 {
@@ -269,14 +301,60 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 			c.Writer.Flush()
 		}
 	}
+	publicSummaries := make(map[string]string)
+	emitSummary := func(key, text string) {
+		if text == "" || publicSummaries[key] == text {
+			return
+		}
+		previous := publicSummaries[key]
+		if previous == "" && thinkingText != "" {
+			emitThinking("\n\n")
+		}
+		emitThinking(sseparser.NormalizeContentDelta(previous, text))
+		publicSummaries[key] = text
+	}
+	emitPublicActivity := func(message chatgpt_types.Message) bool {
+		if message.Author.Role == "assistant" {
+			switch message.Content.ContentType {
+			case "thoughts":
+				for index, thought := range message.Content.Thoughts {
+					emitSummary(fmt.Sprintf("%s:thought:%d", message.ID, index), thought.Summary)
+				}
+				return true
+			case "reasoning_recap":
+				emitSummary(message.ID+":recap", message.Content.Recap)
+				return true
+			}
+		}
+		name, _ := message.Author.Name.(string)
+		isWeb := func(value string) bool {
+			return value == "web" || value == "browser" ||
+				strings.HasPrefix(value, "web.") || strings.HasPrefix(value, "browser.")
+		}
+		if (message.Author.Role == "assistant" && isWeb(message.Recipient)) ||
+			(message.Author.Role == "tool" && isWeb(name)) {
+			// This describes an upstream operation, not a downstream tool call.
+			emitSummary("web-activity", "Searching the web.")
+		}
+		return false
+	}
 	finalizeArtifacts := func() {
 		emitSentinels(materializeArtifactEvents(client, account, convId, artifactState.Finalize(), artifactConfig))
+		if markdown := finalGeneratedImageMarkdown(sentinel, renderedImageFiles); markdown != "" {
+			generatedImageText.WriteString(markdown)
+			if streamOutput {
+				chunk := official_types.NewChatCompletionChunk(markdown, model)
+				chunk.ConversationID = convId
+				c.Writer.WriteString("data: " + chunk.String() + "\n\n")
+				c.Writer.Flush()
+			}
+		}
 	}
 	finalText := func() string {
 		if usedChunkEvents {
-			return visibleText.String()
+			return visibleText.String() + generatedImageText.String()
 		}
-		return sseparser.ReplaceCiteMarkers(previous_text.Text, patchState.CiteAlts)
+		return sseparser.ReplaceCiteMarkers(previous_text.Text, patchState.CiteAlts) + generatedImageText.String()
 	}
 	flushCites := func() {
 		flushed := citePipeline.Flush(patchState.CiteAlts)
@@ -293,10 +371,68 @@ func HandlerDetailedWithOptions(c *gin.Context, response *http.Response, client 
 			visibleText.WriteString(flushed)
 		}
 	}
+	incompleteHandoff := func() bool {
+		return handoffTopicID != "" && !isEnd && !readingSnapshot
+	}
+	recoverHandoff := func() bool {
+		// Replaying a partial answer would duplicate already-delivered content.
+		// Report failure explicitly instead of silently truncating that answer.
+		if translated_request.Action == "continue" || previous_text.Text != "" || visibleText.Len() != 0 || len(imgSource) != 0 || generatedImageText.Len() != 0 {
+			return false
+		}
+		ctx := context.Background()
+		if c.Request != nil {
+			ctx = c.Request.Context()
+		}
+		// Match the transport's allowance for long-running background turns.
+		ctx, cancel := context.WithTimeout(ctx, 600*time.Second)
+		defer cancel()
+		expectedUserID := ""
+		for i := len(translated_request.Messages) - 1; i >= 0; i-- {
+			if translated_request.Messages[i].Author.Role == "user" {
+				expectedUserID = translated_request.Messages[i].ID.String()
+				break
+			}
+		}
+		var beforePoll func()
+		if stream {
+			// Comments keep both Chat Completions and Responses streams alive
+			// without inventing reasoning or writing the caller's protocol.
+			beforePoll = func() {
+				c.Writer.WriteString(": keep-alive\n\n")
+				c.Writer.Flush()
+			}
+		}
+		onProgress := func(body []byte) {
+			for _, payload := range sseparser.DataPayloads(string(body)) {
+				var response chatgpt_types.ChatGPTResponse
+				if json.Unmarshal([]byte(payload), &response) == nil {
+					emitPublicActivity(response.Message)
+				}
+			}
+		}
+		body, err := getCompletedConversation(ctx, client, account, convId, expectedUserID, beforePoll, onProgress)
+		if err != nil {
+			return false
+		}
+		reader = bufio.NewReader(bytes.NewReader(body))
+		readingSnapshot = true
+		usedChunkEvents = false
+		patchState = sseparser.PatchState{}
+		activeChannel = ""
+		currentEvent = ""
+		return true
+	}
 readLoop:
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if incompleteHandoff() {
+				if !recoverHandoff() {
+					return HandlerResult{Err: ErrIncompleteHandoff}
+				}
+				continue readLoop
+			}
 			if err == io.EOF && line == "" {
 				break
 			}
@@ -319,6 +455,12 @@ readLoop:
 						currentEvent = ""
 						continue readLoop
 					}
+				}
+				if incompleteHandoff() {
+					if !recoverHandoff() {
+						return HandlerResult{Err: ErrIncompleteHandoff}
+					}
+					continue readLoop
 				}
 				flushCites()
 				finalizeArtifacts()
@@ -374,13 +516,12 @@ readLoop:
 				if activeChannel == "analysis" {
 					emitThinking(streamEvent.text)
 					if streamEvent.isStop {
+						finalizeArtifacts()
 						if streamOutput {
 							finalLine := official_types.StopChunkWithConversation(finish_reason, model, convId)
-							c.Writer.WriteString("data: " + finalLine.String() + "\n\n")
-							c.Writer.Flush()
+							emitTerminal(finalLine)
 						}
 						if max_tokens && convId != "" && assistantMessageID != "" {
-							finalizeArtifacts()
 							return HandlerResult{
 								Text:              strings.Join(imgSource, "") + finalText(),
 								ThinkingText:      thinkingText,
@@ -398,7 +539,6 @@ readLoop:
 								},
 							}
 						}
-						finalizeArtifacts()
 						return HandlerResult{
 							Text:              strings.Join(imgSource, "") + finalText(),
 							ThinkingText:      thinkingText,
@@ -455,12 +595,11 @@ readLoop:
 				}
 				if streamEvent.isStop {
 					flushCites()
+					finalizeArtifacts()
 					if terminalChunk != nil {
-						c.Writer.WriteString("data: " + terminalChunk.String() + "\n\n")
-						c.Writer.Flush()
+						emitTerminal(*terminalChunk)
 					}
 					if max_tokens && convId != "" && assistantMessageID != "" {
-						finalizeArtifacts()
 						return HandlerResult{
 							Text:              strings.Join(imgSource, "") + finalText(),
 							ThinkingText:      thinkingText,
@@ -478,7 +617,6 @@ readLoop:
 							},
 						}
 					}
-					finalizeArtifacts()
 					return HandlerResult{
 						Text:              strings.Join(imgSource, "") + finalText(),
 						ThinkingText:      thinkingText,
@@ -513,6 +651,10 @@ readLoop:
 			}
 			if original_response.Message.ID != "" && (original_response.Message.Author.Role == "assistant" || original_response.Message.Author.Role == "tool") {
 				assistantMessageID = original_response.Message.ID
+			}
+			if emitPublicActivity(original_response.Message) {
+				currentEvent = ""
+				continue
 			}
 			if activeChannel == "analysis" {
 				thinkingDelta := sseparser.NormalizeContentDelta(thinkingText, sseparser.FirstStringPart(original_response.Message.Content.Parts))
@@ -579,6 +721,7 @@ readLoop:
 					apiUrl = FILES_REVERSE_PROXY
 				}
 				imgSource = make([]string, len(original_response.Message.Content.Parts))
+				legacyImageFiles := make([]string, len(imgSource))
 				var wg sync.WaitGroup
 				for index, part := range original_response.Message.Content.Parts {
 					jsonItem, _ := json.Marshal(part)
@@ -587,11 +730,17 @@ readLoop:
 					if err != nil {
 						continue
 					}
+					legacyImageFiles[index] = extractFileID(dalle_content.AssetPointer)
 					url := apiUrl + strings.Split(dalle_content.AssetPointer, "//")[1] + "/download"
 					wg.Add(1)
 					go GetImageSource(client, &wg, url, dalle_content.Metadata.Dalle.Prompt, account, index, imgSource)
 				}
 				wg.Wait()
+				for index, image := range imgSource {
+					if image != "" && legacyImageFiles[index] != "" {
+						renderedImageFiles[legacyImageFiles[index]] = true
+					}
+				}
 				translated_response := official_types.NewChatCompletionChunk(strings.Join(imgSource, ""), model)
 				if isRole {
 					translated_response.Choices[0].Delta.Role = original_response.Message.Author.Role
@@ -643,12 +792,11 @@ readLoop:
 					finish_reason = "stop"
 				}
 				flushCites()
+				finalizeArtifacts()
 				if streamOutput {
 					final_line := official_types.StopChunkWithConversation(finish_reason, model, convId)
-					c.Writer.WriteString("data: " + final_line.String() + "\n\n")
-					c.Writer.Flush()
+					emitTerminal(final_line)
 				}
-				finalizeArtifacts()
 				return HandlerResult{
 					Text:              strings.Join(imgSource, "") + finalText(),
 					ThinkingText:      thinkingText,
@@ -665,6 +813,12 @@ readLoop:
 			currentEvent = ""
 		}
 		if err == io.EOF {
+			if incompleteHandoff() {
+				if !recoverHandoff() {
+					return HandlerResult{Err: ErrIncompleteHandoff}
+				}
+				continue readLoop
+			}
 			break
 		}
 	}

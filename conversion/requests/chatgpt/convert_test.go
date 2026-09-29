@@ -1,10 +1,14 @@
 package chatgpt
 
 import (
+	"aurora/httpclient"
 	"aurora/internal/accounts"
+	backendchatgpt "aurora/internal/chatgpt"
 	chatgpt_types "aurora/typings/chatgpt"
 	"aurora/typings/official"
 	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -30,24 +34,25 @@ func TestConvertAPIRequestNoToolsNoInjection(t *testing.T) {
 	}
 }
 
-func TestConvertAPIRequestRoutesThinkingAliasThroughReasonHint(t *testing.T) {
+// chatgpt.com sends no system_hints for a selected thinking model; "reason"
+// there yields a fast answer with no thoughts, search, or citations.
+func TestConvertAPIRequestKeepsThinkingModelWithoutReasonHint(t *testing.T) {
 	for _, model := range []string{"gpt-5-6-t-mini", "gpt-5-6-thinking"} {
 		t.Run(model, func(t *testing.T) {
 			out := testConvert(t, official.APIRequest{
-				Model:    model,
-				Messages: []official.APIMessage{official.NewTextMessage("user", "hi")},
+				Model:           model,
+				ReasoningEffort: "xhigh",
+				Messages:        []official.APIMessage{official.NewTextMessage("user", "hi")},
 			})
 
-			if out.Model != "auto" {
-				t.Fatalf("Model = %q, want auto", out.Model)
+			if out.Model != model || out.ThinkingEffort != "max" {
+				t.Fatalf("Model/effort = %q/%q, want %q/max", out.Model, out.ThinkingEffort, model)
 			}
-			if len(out.SystemHints) != 1 || out.SystemHints[0] != "reason" {
-				t.Fatalf("SystemHints = %#v, want [reason]", out.SystemHints)
+			if len(out.SystemHints) != 0 {
+				t.Fatalf("SystemHints = %#v, want none", out.SystemHints)
 			}
-			metadata := out.Messages[0].Metadata
-			hints, ok := metadata["system_hints"].([]string)
-			if !ok || len(hints) != 1 || hints[0] != "reason" {
-				t.Fatalf("message system_hints = %#v, want [reason]", metadata["system_hints"])
+			if hints, ok := out.Messages[0].Metadata["system_hints"]; ok {
+				t.Fatalf("message system_hints = %#v, want absent", hints)
 			}
 		})
 	}
@@ -76,13 +81,13 @@ func TestConvertAPIRequestMapsReasoningEffortToWebEnum(t *testing.T) {
 		effort string
 		want   string
 	}{
-		{name: "default", effort: "", want: "standard"},
+		{name: "default", effort: "", want: ""},
 		{name: "minimal", effort: "minimal", want: "standard"},
 		{name: "low", effort: "low", want: "standard"},
-		{name: "medium", effort: "medium", want: "extended"},
+		{name: "medium", effort: "medium", want: "standard"},
 		{name: "standard", effort: "standard", want: "standard"},
 		{name: "extended", effort: "extended", want: "extended"},
-		{name: "high", effort: "high", want: "max"},
+		{name: "high", effort: "high", want: "extended"},
 		{name: "xhigh", effort: "xhigh", want: "max"},
 		{name: "max", effort: "max", want: "max"},
 		{name: "unknown", effort: "turbo", want: "standard"},
@@ -102,11 +107,10 @@ func TestConvertAPIRequestMapsReasoningEffortToWebEnum(t *testing.T) {
 	}
 }
 
-// 验证 reasoning_effort 也会触发 system_hints:["reason"](不只是模型名)。
+// Auto routing can use effort to select reasoning without overriding explicit models.
 func TestConvertAPIRequestReasoningEffortTriggersSystemHint(t *testing.T) {
-	// high effort + 普通模型名 → 应注入 system_hints
 	out := testConvert(t, official.APIRequest{
-		Model:           "gpt-5-6",
+		Model:           "auto",
 		ReasoningEffort: "high",
 		Messages:        []official.APIMessage{official.NewTextMessage("user", "hi")},
 	})
@@ -118,7 +122,7 @@ func TestConvertAPIRequestReasoningEffortTriggersSystemHint(t *testing.T) {
 	}
 	// extended 也应触发
 	out2 := testConvert(t, official.APIRequest{
-		Model: "gpt-4o-mini", ReasoningEffort: "extended",
+		Model: "", ReasoningEffort: "extended",
 		Messages: []official.APIMessage{official.NewTextMessage("user", "hi")},
 	})
 	if len(out2.SystemHints) != 1 || out2.SystemHints[0] != "reason" {
@@ -131,6 +135,46 @@ func TestConvertAPIRequestReasoningEffortTriggersSystemHint(t *testing.T) {
 	})
 	if len(out3.SystemHints) != 0 {
 		t.Fatalf("no effort: SystemHints = %#v, want empty", out3.SystemHints)
+	}
+}
+
+type conversionCaptureClient struct {
+	httpclient.AuroraHttpClient
+	body []byte
+}
+
+func (c *conversionCaptureClient) Request(_ httpclient.HttpMethod, _ string, _ httpclient.AuroraHeaders, _ []*http.Cookie, body io.Reader) (*http.Response, error) {
+	var err error
+	c.body, err = io.ReadAll(body)
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, err
+}
+
+func TestConvertAPIRequestPreservesExplicitModelAndOptionalEffort(t *testing.T) {
+	for _, model := range []string{"gpt-6-pro", "gpt-5-6-pro", "gpt-5-6", "gpt-4o-mini", "gpt-5-5-thinking", "gpt-5-6-thinking", "gpt-5-6-t-mini"} {
+		for effort, want := range map[string]string{"": "", "low": "standard", "medium": "standard", "extended": "extended", "high": "extended", "xhigh": "max", "max": "max"} {
+			t.Run(model+"/"+effort, func(t *testing.T) {
+				out := testConvert(t, official.APIRequest{Model: model, ReasoningEffort: effort})
+				// Inspect the actual completion body, including backend sanitization.
+				client := &conversionCaptureClient{}
+				response, err := backendchatgpt.POSTconversationPreparedWithState(client, out, &accounts.Account{Type: accounts.TypePUID}, nil, "", "offline-conduit", "offline-trace", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer response.Body.Close()
+				data := client.body
+				var payload map[string]interface{}
+				if err := json.Unmarshal(data, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload["model"] != model {
+					t.Fatalf("explicit model routing changed: %s", data)
+				}
+				value, present := payload["thinking_effort"]
+				if (want == "" && present) || (want != "" && value != want) {
+					t.Fatalf("thinking_effort = %#v (present %v), want %q", value, present, want)
+				}
+			})
+		}
 	}
 }
 

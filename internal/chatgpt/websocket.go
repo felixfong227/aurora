@@ -34,7 +34,7 @@ func RequiresConversationWebsocket(stream bool, thinkingEffort string) bool {
 	if stream {
 		return true
 	}
-	switch normalizeThinkingEffort(thinkingEffort) {
+	switch NormalizeThinkingEffort(thinkingEffort) {
 	case "extended", "max":
 		return true
 	default:

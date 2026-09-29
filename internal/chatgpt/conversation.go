@@ -243,17 +243,21 @@ func sanitizeConversationCompletionRequest(message chatgpt_types.ChatGPTRequest)
 	message.SupportsBuffering = false
 	message.SupportedEncodings = nil
 	message.ClientContextualInfo = nil
-	message.ThinkingEffort = normalizeThinkingEffort(message.ThinkingEffort)
+	message.ThinkingEffort = NormalizeThinkingEffort(message.ThinkingEffort)
 	return message
 }
 
-func normalizeThinkingEffort(effort string) string {
+// NormalizeThinkingEffort maps medium/high/xhigh to the website's distinct
+// Standard/Extended/Heavy levels. An omitted effort stays omitted.
+func NormalizeThinkingEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "", "none", "minimal", "low", "standard":
+	case "":
+		return ""
+	case "none", "minimal", "low", "medium", "standard":
 		return "standard"
-	case "medium", "extended":
+	case "high", "extended":
 		return "extended"
-	case "high", "xhigh", "max":
+	case "xhigh", "max":
 		return "max"
 	default:
 		return "standard"
@@ -342,6 +346,10 @@ type ContinueInfo struct {
 
 // HandlerResult 是 HandlerDetailedWithOptions 的返回值。
 type HandlerResult struct {
+	// Err stops callers from emitting a successful completion after recovery fails.
+	Err error
+	// Completed is proven by an upstream terminal event, never by transport EOF.
+	Completed         bool
 	Text              string
 	ThinkingText      string
 	ConversationID    string
@@ -352,6 +360,7 @@ type HandlerResult struct {
 	PDFArtifacts      []PDFArtifact
 	GeneratedImageIDs []string
 	StopSent          bool
+	DeferredTerminal  *official_types.ChatCompletionChunk
 	Continue          *ContinueInfo
 	ToolCalls         []official_types.ToolCall
 }

@@ -362,11 +362,27 @@ func ExtractSignalsFromJSON(v interface{}) []ArtifactSignal {
 	return dedupeSignals(out)
 }
 
+func isThoughtArtifactPayload(value map[string]interface{}) bool {
+	content, _ := value["content"].(map[string]interface{})
+	kind, _ := value["content_type"].(string)
+	nestedKind, _ := content["content_type"].(string)
+	patchPath, _ := value["p"].(string)
+	return kind == "thoughts" || kind == "reasoning_recap" ||
+		nestedKind == "thoughts" || nestedKind == "reasoning_recap" ||
+		strings.HasPrefix(patchPath, "/message/content/thoughts")
+}
+
 func walkSignals(v interface{}, ctx string, out *[]ArtifactSignal) {
 	switch x := v.(type) {
 	case map[string]interface{}:
+		if isThoughtArtifactPayload(x) {
+			return
+		}
 		inspectMessageMap(x, out)
 		for k, val := range x {
+			if k == "thoughts" {
+				continue
+			}
 			walkSignals(val, k, out)
 		}
 	case []interface{}:
@@ -565,6 +581,9 @@ func parseGeneratedImagesFromValue(value interface{}) []parsedGeneratedImage {
 func walkGeneratedImages(value interface{}, messageID, genID, parentGenID string, slotIndex int, out *[]parsedGeneratedImage) {
 	switch item := value.(type) {
 	case map[string]interface{}:
+		if isThoughtArtifactPayload(item) {
+			return
+		}
 		nextMessageID := messageID
 		if id, _ := item["id"].(string); id != "" {
 			if author, ok := item["author"].(map[string]interface{}); ok {
@@ -613,7 +632,10 @@ func walkGeneratedImages(value interface{}, messageID, genID, parentGenID string
 				}
 			}
 		}
-		for _, nested := range item {
+		for key, nested := range item {
+			if key == "thoughts" {
+				continue
+			}
 			walkGeneratedImages(nested, nextMessageID, nextGenID, nextParentGenID, nextSlotIndex, out)
 		}
 	case []interface{}:

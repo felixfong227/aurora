@@ -5,6 +5,7 @@ import (
 	"aurora/internal/accounts"
 	"aurora/internal/authresolver"
 	"aurora/internal/chatgpt"
+	"aurora/internal/httpstream"
 	"aurora/internal/proxy"
 	chatgpt_types "aurora/typings/chatgpt"
 	official_types "aurora/typings/official"
@@ -44,6 +45,7 @@ type ExecuteRequest struct {
 
 // ExecuteResult 会话执行结果。
 type ExecuteResult struct {
+	Err            error
 	Text           string
 	ThinkingText   string
 	ConversationID string
@@ -113,6 +115,10 @@ func (f *FlowOrchestrator) ExecuteConversation(c *gin.Context, req ExecuteReques
 			ArtifactDelivery: req.OriginalRequest.ArtifactDelivery,
 			ProxyURL:         proxyURL,
 		})
+		if result.Err != nil {
+			httpstream.WriteChatCompletionError(c, result.Err)
+			return ExecuteResult{Err: result.Err}
+		}
 		wsConn = nil
 
 		fullResponse += result.Text
@@ -222,6 +228,10 @@ func (f *FlowOrchestrator) HandleToolCalling(c *gin.Context, req ExecuteRequest)
 			ProxyURL:         proxyURL,
 		})
 		response.Body.Close()
+		if result.Err != nil {
+			httpstream.WriteChatCompletionError(c, result.Err)
+			return ExecuteResult{Err: result.Err}
+		}
 
 		lastText = result.Text
 		lastConversationID = result.ConversationID

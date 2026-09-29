@@ -17,34 +17,20 @@ import (
 func ConvertAPIRequest(api_request official_types.APIRequest, account *accounts.Account, proxy string, client httpclient.AuroraHttpClient) chatgpt_types.ChatGPTRequest {
 	chatgpt_request := chatgpt_types.NewChatGPTRequest()
 
-	// ChatGPT Web 使用 model=auto + system_hints=["reason"] 开启思考模式，
-	// 当前服务端会将其路由到 gpt-5-6-t-mini。对外仍保留调用方的模型名。
+	// Preserve every explicit upstream model ID, including advertised thinking models.
 	model := api_request.Model
 	if model == "" {
 		model = "auto"
 	}
+	chatgpt_request.Model = model
 	if usesReasonSystemHint(model, api_request.ReasoningEffort) {
-		chatgpt_request.Model = "auto"
 		chatgpt_request.SystemHints = []string{"reason"}
-	} else {
-		chatgpt_request.Model = model
 	}
 
 	// ── 映射 OpenAI 标准生成参数到 ChatGPT ──
 
-	// reasoning_effort → ChatGPT Web 的 thinking_effort 枚举。
-	// 上游只接受 standard / extended / max；发送 OpenAI 的 low / medium / high
-	// 会导致 /f/conversation 返回 422 "Invalid conversation body"。
-	switch strings.ToLower(strings.TrimSpace(api_request.ReasoningEffort)) {
-	case "none", "minimal", "low", "standard", "":
-		chatgpt_request.ThinkingEffort = "standard"
-	case "medium", "extended":
-		chatgpt_request.ThinkingEffort = "extended"
-	case "high", "xhigh", "max":
-		chatgpt_request.ThinkingEffort = "max"
-	default:
-		chatgpt_request.ThinkingEffort = "standard"
-	}
+	// Share the website effort mapping with final request serialization.
+	chatgpt_request.ThinkingEffort = backendchatgpt.NormalizeThinkingEffort(api_request.ReasoningEffort)
 
 	// response_format: 通过 system prompt 注入指令
 	var responseFormatHint string
@@ -168,13 +154,13 @@ func ConvertAPIRequest(api_request official_types.APIRequest, account *accounts.
 }
 
 // usesReasonSystemHint 判断是否应向上游注入 system_hints:["reason"] 开启思考模式。
-// 触发条件(任一):
-//   - 模型名为显式思考模型(gpt-5-6-t-mini / gpt-5-6-thinking)
-//   - reasoning_effort 表明用户要思考(extended / max 等,高于 standard)
+// Only auto routing uses it; chatgpt.com sends no hints for an explicitly
+// selected thinking model, and adding "reason" there skips its reasoning/tools.
 func usesReasonSystemHint(model string, reasoningEffort string) bool {
 	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "gpt-5-6-t-mini", "gpt-5-6-thinking":
-		return true
+	case "", "auto":
+	default:
+		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(reasoningEffort)) {
 	case "medium", "extended", "high", "xhigh", "max":
